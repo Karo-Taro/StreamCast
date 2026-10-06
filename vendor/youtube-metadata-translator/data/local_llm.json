@@ -1,0 +1,6 @@
+{
+  "temperature": 0.25,
+  "max_tokens": 2400,
+  "timeout_seconds": 180,
+  "max_parallel_languages": "auto"
+}

@@ -9,6 +9,25 @@ target) — a "live" channel that runs forever without you touching it.
 It's built for a **single owner**: you log in with one password, and every
 stream is yours. No sign-up, no billing, no multi-tenant complexity.
 
+
+## Dashboard Features
+
+- **System Monitoring**: Real-time CPU and RAM usage tracking.
+- **Advanced Storage Management**: Set any connected storage as the default;
+  when a disk runs low, uploads and encodes spill over to the others.
+- **Quality modes**: Max quality / Balanced / Max performance — the queue is
+  re-encoded in the background when you switch.
+- **Fast upload**: the "already encoded" checkbox skips ffmpeg — files prepared
+  by the local encoder join the queue instantly.
+- **Music streams**: a looping background video with an audio playlist, mixer
+  and limiter.
+- **Metadata localization**: automatic translation of the title and description
+  into 90+ languages (see the section below).
+- **Accounts & roles**: a master password plus workers scoped to their streams.
+- **Self-healing**: a watchdog restarts ffmpeg; streams that were live before a
+  server restart go back online automatically (with continuous uptime).
+
+
 ## How it works
 
 1. **Upload** videos to a stream. Every file is queued for encoding.
@@ -22,6 +41,42 @@ stream is yours. No sign-up, no billing, no multi-tenant complexity.
 
 Uploads at 60fps or higher are rejected on purpose — mixing frame rates breaks
 seamless concatenation.
+
+## Metadata translation (localization)
+
+Built-in title & description localization powered by the
+[youtube-metadata-translator](https://github.com/ErrorGone-YT/youtube-metadata-translator)
+engine (vendored at `vendor/youtube-metadata-translator`, updatable right from
+the admin panel).
+
+**Features**
+
+- On a stream's Edit page — the **Metadata localization** block: source (from
+  the video or manual), what to localize (everything / titles / descriptions),
+  90+ languages with presets, and a **Translate now** button with progress and
+  a live log.
+- Localizations are applied to the YouTube video via the Data API — viewers
+  see the title and description in their language.
+- Multiple connected channels: the channel owning the video is picked
+  automatically for every translation.
+- Autofill: pasting a video link fills the stream name, channel name and the
+  translation source with the actual data.
+
+**Setup (Admin → Translation)**
+
+1. In Google Cloud Console (a project with **YouTube Data API v3** enabled),
+   create an OAuth client of the **Web application** type and add the redirect
+   URI `https://your-domain/oauth2callback` (or set `STREAMCAST_SITE_URL`).
+2. Upload the downloaded `client_secrets.json` in the admin panel and click
+   **Connect** — sign in with the channel's account. Repeat for other channels
+   if needed.
+3. Add an AI provider: LM Studio / Ollama (local, no keys) or any
+   OpenAI-compatible API / Gemini (keys are verified with **Check keys**,
+   including a balance check).
+4. Set the parallelism ("auto" by default — one thread per API key).
+
+Engine data (tokens, providers, presets) lives in `storage/yt_translator_data/`
+and survives engine updates via the **↻ Update from GitHub** button.
 
 ## Requirements
 
@@ -222,6 +277,9 @@ All settings are environment variables (see `.env.example`):
 | `STREAMCAST_FPS` | 30 | Output frame rate |
 | `STREAMCAST_VBITRATE` | 4500k | Video bitrate |
 | `STREAMCAST_MAX_UPLOAD_MB` | 8192 | Max upload size |
+| `STREAMCAST_AUTORESUME` | `1` | Auto-restart live streams after a server restart (0 to disable) |
+| `STREAMCAST_MAX_FPS` | 60 | Videos at or above this fps are rejected on upload |
+| `STREAMCAST_SITE_URL` | empty | Public URL of the panel (OAuth redirect base `<URL>/oauth2callback`) |
 
 ---
 

@@ -17,6 +17,7 @@ import uuid
 
 import config
 import db
+import storage
 
 # Active encode jobs keyed by video id, so a delete request can terminate the
 # running ffmpeg instead of trusting a DB-stored PID (stale/reused PIDs would
@@ -80,7 +81,8 @@ def _mode_for(video):
     return mode if mode in config.QUALITY_MODES else "balanced"
 
 
-def _transcode(video, cmd, out_path, total_duration, src_dims=(None, None), mode="balanced"):
+def _transcode(video, cmd, out_path, total_duration, src_dims=(None, None), mode="balanced",
+               out_storage_id=None):
     """Run an ffmpeg normalize job, streaming progress into the DB."""
     proc = subprocess.Popen(
         cmd, stderr=subprocess.PIPE, text=True,
@@ -135,23 +137,28 @@ def _transcode(video, cmd, out_path, total_duration, src_dims=(None, None), mode
         size = None
 
     # Keep the previous-quality copy playable while the rest of the queue is
-    # re-encoding into a new mode (see _build_playlist in streamer.py).
+    # re-encoding into a new mode (see _build_playlist in streamer.py). It
+    # stays wherever it was; the row records that storage explicitly.
     old_name = video["encoded_name"] if "encoded_name" in video.keys() else None
     old_preset = (video["encode_preset"] if "encode_preset" in video.keys() else None) or "balanced"
     updates = {
         "status": "completed", "encoded_name": out_path.name,
+        "encoded_storage_id": out_storage_id,
         "duration": duration, "width": src_dims[0], "height": src_dims[1],
         "size": size, "encode_preset": mode, "error_msg": "", "progress": 100.0,
     }
     if old_name and old_preset != mode:
         updates["prev_encoded_name"] = old_name
         updates["prev_encode_preset"] = old_preset
+        updates["prev_encoded_storage_id"] = video["encoded_storage_id"] \
+            if "encoded_storage_id" in video.keys() else None
     else:
         updates["prev_encoded_name"] = None
         updates["prev_encode_preset"] = None
+        updates["prev_encoded_storage_id"] = None
         if old_name and old_name != out_path.name:
             try:
-                (config.ENCODED_DIR / old_name).unlink(missing_ok=True)
+                storage.video_encoded_path(video, old_name).unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -174,8 +181,27 @@ def _make_thumb(out_path):
         pass
 
 
+def _bitrate_bps(value):
+    """'4500k' -> 4_500_000 (ffmpeg-style bitrate strings)."""
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([kKmM]?)$", str(value or ""))
+    if not m:
+        return 0
+    mult = {"": 1, "k": 1000, "m": 1_000_000}[m.group(2).lower()]
+    return int(float(m.group(1)) * mult)
+
+
+def _estimate_encoded_bytes(preset, kind, duration):
+    """Rough size of the copy ffmpeg is about to write, so a storage can be
+    picked that will actually hold it (duration is known from the probe)."""
+    if kind == "audio":
+        rate = _bitrate_bps(preset["mp3_bitrate"])
+    else:
+        rate = _bitrate_bps(preset["vbitrate"]) + _bitrate_bps(preset["audio_bitrate"])
+    return int(duration * rate / 8 * 1.15) + 2 * 1024 ** 2
+
+
 def _encode_one(video):
-    src = config.UPLOAD_DIR / video["stored_name"]
+    src = storage.video_upload_path(video)
     if not src.exists():
         db.update_video(video["id"], status="error", error_msg="Source file missing")
         return
@@ -195,14 +221,30 @@ def _encode_one(video):
         )
         return
 
-    db.update_video(video["id"], status="encoding", error_msg="", progress=0.0)
-
     mode = _mode_for(video)
     preset = config.QUALITY_MODES[mode]
 
+    # Where to write the encoded copy: this video's own storage when it has
+    # room (keeps a re-encode's prev-copy reachable), otherwise whichever
+    # storage does. The row remembers the choice via encoded_storage_id.
+    prefer = storage.storage_for(video, "encoded_storage_id", "storage_id")
+    targets = storage.encode_targets(prefer["id"],
+                                     needed=_estimate_encoded_bytes(preset, kind, src_duration))
+    if not targets:
+        db.update_video(
+            video["id"], status="error",
+            error_msg=(f"No storage has ~{_fmt_gb(_estimate_encoded_bytes(preset, kind, src_duration))} GB "
+                       f"free for the encoded copy (min free: {config.MIN_FREE_GB} GB)"),
+        )
+        return
+    target = targets[0]
+    out_dir = storage.encoded_dir(target)
+
+    db.update_video(video["id"], status="encoding", error_msg="", progress=0.0)
+
     if kind == "audio":
         # Normalize to CBR MP3 so the concat playlist plays tracks seamlessly.
-        out_path = config.ENCODED_DIR / f"{uuid.uuid4().hex}.mp3"
+        out_path = out_dir / f"{uuid.uuid4().hex}.mp3"
         cmd = [
             config.FFMPEG, "-y", "-i", str(src),
             "-vn",
@@ -212,7 +254,7 @@ def _encode_one(video):
         ]
     else:
         w, h = preset["width"], preset["height"]
-        out_path = config.ENCODED_DIR / f"{uuid.uuid4().hex}.mp4"
+        out_path = out_dir / f"{uuid.uuid4().hex}.mp4"
 
         vf = (
             f"scale={w}:{h}:"
@@ -233,7 +275,12 @@ def _encode_one(video):
             str(out_path),
         ]
 
-    _transcode(video, cmd, out_path, src_duration, src_dims=(src_w, src_h), mode=mode)
+    _transcode(video, cmd, out_path, src_duration, src_dims=(src_w, src_h), mode=mode,
+               out_storage_id=target["id"])
+
+
+def _fmt_gb(n_bytes):
+    return round(n_bytes / 1024 ** 3, 1)
 
 
 class EncoderWorker:

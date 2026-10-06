@@ -1,2 +1,8 @@
 Flask==3.0.3
 gunicorn==22.0.0; sys_platform != "win32"
+psutil
+google-api-python-client==2.142.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+isodate==0.7.2
+requests==2.32.3

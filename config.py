@@ -60,6 +60,11 @@ TRUST_PROXY = _env("STREAMCAST_TRUST_PROXY", "1") == "1"
 HOST = _env("STREAMCAST_HOST", "127.0.0.1")
 PORT = int(_env("STREAMCAST_PORT", "5000"))
 
+# Public base URL of this instance (no trailing slash). Used as the OAuth
+# redirect base: <SITE_URL>/oauth2callback must be registered in the Google
+# Cloud console. Empty = derived from the incoming request.
+SITE_URL = _env("STREAMCAST_SITE_URL", "").rstrip("/")
+
 # --- Streaming --------------------------------------------------------------
 # Default YouTube ingest endpoint. Users only paste their stream KEY in the UI.
 RTMP_BASE = _env("STREAMCAST_RTMP_BASE", "rtmp://a.rtmp.youtube.com/live2")
@@ -105,6 +110,9 @@ QUALITY_MODES = {
 # Uploads at or above this fps are rejected (matches the "blocks 60fps!" rule).
 MAX_FPS = int(_env("STREAMCAST_MAX_FPS", "60"))
 
+# Restart streams that were live when the server stopped (1/0).
+AUTO_RESUME = _env("STREAMCAST_AUTORESUME", "1") == "1"
+
 MAX_UPLOAD_MB = int(_env("STREAMCAST_MAX_UPLOAD_MB", "8192"))  # 8 GB
 ALLOWED_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v"}
 
@@ -117,6 +125,11 @@ ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".
 # seconds so we don't reconnect to YouTube too often. Lower = faster pickup of
 # queue changes but more frequent reconnects.
 RELOAD_BLOCK_SECONDS = int(_env("STREAMCAST_RELOAD_BLOCK_SECONDS", "900"))
+
+# Extra storages (admin panel) and the main one stop accepting new files when
+# their disk has less than this much free space — the DB/WAL and ffmpeg share
+# those disks too, and a 100%-full disk breaks everything on it.
+MIN_FREE_GB = int(_env("STREAMCAST_MIN_FREE_GB", "5"))
 
 # How long YouTube keeps a broadcast alive without incoming data before it
 # finalizes it and saves it as a video (~1 minute in practice, undocumented).

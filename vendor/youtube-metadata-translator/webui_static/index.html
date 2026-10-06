@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YouTube Metadata Translator</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236366f1'/%3E%3Cstop offset='1' stop-color='%23a855f7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath d='M26 19l19 13-19 13z' fill='white'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- Онбординг -->
+<div id="onboarding" class="overlay hidden">
+  <div class="onboard-card card">
+    <div class="onboard-logo">🎬</div>
+    <h1 data-i18n="app_title"></h1>
+    <p class="muted" data-i18n="onboard_sub"></p>
+    <div class="lang-picker" id="ob_langs"></div>
+    <label class="field-label" data-i18n="your_name"></label>
+    <input id="ob_name" class="input" data-i18n-ph="your_name_ph" autocomplete="off">
+    <button id="ob_start" class="btn primary big" data-i18n="start"></button>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-icon">🎬</span><span>Metadata<br>Translator</span></div>
+    <div id="hello" class="hello"></div>
+    <nav id="nav"></nav>
+    <div class="sidebar-foot">
+      <div id="nav_job_dot" class="job-dot hidden" title="…"></div>
+      <button id="quit_btn" class="icon-btn" title="✕">⏻</button>
+    </div>
+  </aside>
+
+  <main id="screen" class="screen"></main>
+</div>
+
+<div id="modal_root" class="hidden"></div>
+<div id="toasts"></div>
+
+<script src="/static/lang_names.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

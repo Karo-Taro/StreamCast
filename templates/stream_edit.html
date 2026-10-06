@@ -56,6 +56,11 @@
       <label for="name">Stream name</label>
       <input type="text" id="name" name="name" value="{{ stream.name if stream else '' }}" placeholder="e.g. Lo-fi radio 24/7" required>
     </div>
+    <div class="field">
+      <label for="channel_name">Channel name</label>
+      <input type="text" id="channel_name" name="channel_name" value="{{ stream.channel_name if stream else '' }}" placeholder="e.g. Lofi Girl">
+    </div>
+    {% include '_translate_section.html' %}
     {% if not stream %}
     <div class="field">
       <label>Stream type</label>
@@ -117,4 +122,40 @@
     <button type="submit" class="btn btn-primary">{{ 'Create stream' if not stream else 'Save changes' }}</button>
   </form>
 </div>
+
+<script>
+// Autofill: when a YouTube URL is entered, pull the video's title and channel
+// name and fill the empty fields (never overwrites what's already typed).
+(function () {
+  const ytUrl = document.getElementById('youtube_url');
+  if (!ytUrl) return;
+  let busy = false;
+  ytUrl.addEventListener('change', async () => {
+    const url = ytUrl.value.trim();
+    if (!url || busy) return;
+    busy = true;
+    try {
+      const r = await fetch('/api/yt_lookup?url=' + encodeURIComponent(url),
+                            {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      const d = await r.json();
+      if (d && (d.title || d.channel_title)) {
+        // Bring the fields up to date with the actual video — including ones
+        // the user typed manually before pasting the URL.
+        const name = document.getElementById('name');
+        const ch = document.getElementById('channel_name');
+        if (d.title) name.value = d.title;
+        if (d.channel_title) ch.value = d.channel_title;
+        const t = document.getElementById('trTitle');
+        const ds = document.getElementById('trDesc');
+        if (t) t.value = d.title || '';
+        if (ds) ds.value = d.description || '';
+        if (window.showFlash) {
+          showFlash('Updated stream name, channel & translation source from YouTube', 'ok');
+        }
+      }
+    } catch (e) { /* autofill is best-effort */ }
+    finally { busy = false; }
+  });
+})();
+</script>
 {% endblock %}

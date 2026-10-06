@@ -29,9 +29,14 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=25">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=27">
 </head>
 <body>
+  <script>
+    // Pre-paint: hide dashboard thumbnails before tiles render if the user
+    // turned them off (same trick as the theme script — no flash of thumbs).
+    try { if (localStorage.getItem('sc-thumbs') === '0') document.body.classList.add('no-thumbs'); } catch (e) {}
+  </script>
   <div class="topbar">
     <a href="{{ url_for('dashboard') }}" class="brand"><span class="dot"></span>StreamCast</a>
     <nav>

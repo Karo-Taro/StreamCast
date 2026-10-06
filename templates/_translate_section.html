@@ -1,0 +1,466 @@
+{# Metadata localization section (edit page, existing streams only).
+   Context: stream, tr_ready, tr_error, tr_channel, tr_catalog, tr_presets, tr_languages #}
+<style>
+  .tr-card { border:1px solid var(--border-strong); border-radius:12px; padding:16px; background:var(--surface-2); }
+  .tr-head { display:flex; align-items:center; gap:12px; }
+  .tr-head .tr-title { font-weight:700; }
+  .tr-head .hint { margin:0; }
+  .tr-body { margin-top:14px; display:flex; flex-direction:column; gap:16px; }
+  .tr-collapsed .tr-body { display:none; }
+  .tr-row { display:flex; flex-direction:column; gap:8px; }
+  .tr-label { font-size:12px; font-weight:700; letter-spacing:.06em; color:var(--muted); text-transform:uppercase; }
+  .tr-seg { display:flex; gap:8px; flex-wrap:wrap; }
+  .tr-seg label {
+    border:1px solid var(--border-strong); border-radius:999px;
+    padding:7px 14px; font-size:13px; font-weight:600; cursor:pointer;
+    color:var(--text-2);
+  }
+  .tr-seg label:has(input:checked) {
+    border-color: var(--accent, #6d87ff); color: var(--accent, #6d87ff);
+    background: rgba(109,135,255,.10);
+    box-shadow: 0 0 0 1px var(--accent, #6d87ff) inset;
+  }
+  .tr-seg input { position:absolute; opacity:0; pointer-events:none; }
+  /* unified source fields: same look for input and textarea */
+  .tr-field {
+    font:inherit; font-size:13.5px; color:var(--text);
+    background:var(--surface); border:1px solid var(--border-strong);
+    border-radius:10px; padding:9px 12px; width:100%; box-sizing:border-box;
+    outline:none; transition:border-color .2s;
+  }
+  .tr-field:focus { border-color: var(--accent, #6d87ff); }
+  textarea.tr-field { resize:vertical; min-height:90px; line-height:1.45; white-space:pre-wrap; }
+  .tr-field.readonly { opacity:.72; cursor:not-allowed; background:var(--surface-2); }
+  .tr-fields-top { display:flex; align-items:center; gap:8px; }
+  .tr-fields-top .hint { margin:0; flex:1; }
+  .tr-chips { display:flex; gap:8px; flex-wrap:wrap; }
+  .tr-preset-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .tr-chip {
+    display:inline-flex; align-items:center; gap:6px;
+    border:1px solid var(--border-strong); border-radius:999px;
+    padding:4px 10px; font-size:12.5px; font-weight:600; background:var(--surface);
+  }
+  .tr-chip button { background:none; border:none; color:var(--muted); cursor:pointer;
+                    font:inherit; padding:0 0 0 2px; line-height:1; }
+  .tr-chip button:hover { color:#d9534f; }
+  .tr-langs-toggle { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none;
+                     font-size:13px; font-weight:600; color:var(--text-2); }
+  .tr-langs-wrap { display:none; }
+  .tr-langs-wrap.open { display:block; }
+  .tr-langs {
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:4px 12px;
+    border:1px solid var(--border); border-radius:10px; padding:10px 14px;
+    background:var(--surface); max-height:260px; overflow-y:auto;
+  }
+  .tr-langs label { display:flex; align-items:center; gap:7px; font-size:13px; cursor:pointer;
+                    padding:2px 0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .tr-langs input { accent-color: var(--accent, #6d87ff); flex:none; }
+  .tr-actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .tr-progress { flex:1; min-width:160px; height:6px; background:var(--border); border-radius:3px; overflow:hidden; }
+  .tr-progress > div { height:100%; width:0%; background:var(--accent, #6d87ff); transition:width .3s; }
+  .tr-log {
+    display:none; background:var(--surface); border:1px solid var(--border); border-radius:10px;
+    font-family:var(--mono, monospace); font-size:11.5px; padding:10px 12px;
+    max-height:180px; overflow-y:auto; white-space:pre-wrap; overflow-wrap:anywhere;
+  }
+  .tr-log.open { display:block; }
+  .tr-log .k-ok { color:#34c759; }
+  .tr-log .k-fail { color:#ff6b81; }
+  .tr-log .k-retry { color:#f0a020; }
+</style>
+
+{% set tr_enabled = stream and stream.translate_enabled %}
+{% set tr_source = (stream.translate_source or 'video') if stream else 'video' %}
+{% set tr_parts = (stream.translate_parts or 'all') if stream else 'all' %}
+{% set tr_title_val = stream.translate_title if stream else '' %}
+{% set tr_desc_val = stream.translate_description if stream else '' %}
+
+<div class="field" id="translateSection">
+  <div class="tr-card {{ 'tr-collapsed' if not tr_enabled }}">
+    <div class="tr-head">
+      <label class="switch" title="Enable metadata localization">
+        <input type="checkbox" id="translate_enabled" name="translate_enabled" {{ 'checked' if tr_enabled }}>
+        <span class="slider round"></span>
+      </label>
+      <div>
+        <div class="tr-title">Metadata localization</div>
+        <p class="hint">Translate this stream's title &amp; description into multiple languages and apply them to the YouTube video.</p>
+      </div>
+    </div>
+
+    <div class="tr-body">
+      {% if not tr_ready %}
+      <p class="hint" style="color:#d9534f; margin:0;">Translator engine unavailable: {{ tr_error }}</p>
+      {% else %}
+      {% if not tr_channel %}
+      <p class="hint" style="color:#f0a020; margin:0;">⚠️ No YouTube channel connected — connect one in Admin → Translation (OAuth), then reload this page.</p>
+      {% endif %}
+
+      <div class="tr-row">
+        <span class="tr-label">Title &amp; description</span>
+        <div class="tr-seg">
+          <label><input type="radio" name="translate_source" value="video" {{ 'checked' if tr_source == 'video' }}>From video</label>
+          <label><input type="radio" name="translate_source" value="manual" {{ 'checked' if tr_source == 'manual' }}>Enter manually</label>
+        </div>
+        <div class="tr-fields-top">
+          <span class="hint">What will be translated</span>
+          <button type="button" class="btn" id="trRefresh" title="Pull the current title & description from the URL above">⟳ Fetch from YouTube</button>
+        </div>
+        <div id="trTitleRow">
+          <input type="text" class="tr-field" id="trTitle" name="translate_title"
+                 value="{{ tr_title_val }}" placeholder="Source title">
+        </div>
+        <div id="trDescRow">
+          <textarea class="tr-field" id="trDesc" name="translate_description"
+                    rows="5" placeholder="Source description">{{ tr_desc_val }}</textarea>
+        </div>
+      </div>
+
+      <div class="tr-row">
+        <span class="tr-label">What to localize</span>
+        <div class="tr-seg">
+          <label><input type="radio" name="translate_parts" value="all" {{ 'checked' if tr_parts == 'all' }}>Everything</label>
+          <label><input type="radio" name="translate_parts" value="title" {{ 'checked' if tr_parts == 'title' }}>Titles only</label>
+          <label><input type="radio" name="translate_parts" value="description" {{ 'checked' if tr_parts == 'description' }}>Descriptions only</label>
+        </div>
+      </div>
+
+      <div class="tr-row">
+        <span class="tr-label">Languages</span>
+        <div class="tr-chips" id="trChips"></div>
+        <div class="tr-preset-row">
+          <select id="trPreset" class="tr-field" style="max-width:260px;">
+            <option value="">Language preset…</option>
+            {% for name in tr_presets %}
+            <option value="{{ name }}">{{ name }} ({{ tr_presets[name]|length }})</option>
+            {% endfor %}
+          </select>
+          <span class="hint" id="trPresetState" style="margin:0; display:none; color:#f0a020;">unsaved changes</span>
+          <button type="button" class="btn" id="trPresetApply" title="Apply the selected preset">✓ Apply</button>
+          <button type="button" class="btn" id="trPresetSave" title="Overwrite the selected preset with the current selection">+ Save current</button>
+          <button type="button" class="btn" id="trPresetSaveAs" title="Save the current selection as a new preset">⎘ Save as…</button>
+          <button type="button" class="btn" id="trPresetDelete" title="Delete the selected preset" style="color:#d9534f;">✕ Delete</button>
+        </div>
+        <label class="tr-langs-toggle">
+          <span class="switch">
+            <input type="checkbox" id="trLangsToggle">
+            <span class="slider round"></span>
+          </span>
+          Show full language list ({{ tr_catalog|length }})
+        </label>
+        <div class="tr-langs-wrap" id="trLangsWrap">
+          <div class="tr-langs" id="trLangs">
+            {% for code, name in tr_catalog.items()|sort(attribute='1') %}
+            <label><input type="checkbox" name="translate_languages" value="{{ code }}"
+                          {{ 'checked' if code in tr_languages }}> <b>{{ code }}</b> — {{ name }}</label>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+
+      <div class="tr-log" id="trLog"></div>
+      <div class="tr-actions">
+        <button type="button" class="btn btn-primary" id="trRun">Translate now</button>
+        <div class="tr-progress" id="trProgress" style="display:none;"><div></div></div>
+        <span class="hint" id="trStatus" style="margin:0;"></span>
+      </div>
+      {% if not stream %}
+      <p class="hint" style="margin:0;">Pressing Translate saves this stream and starts the localization right away.</p>
+      {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<script>
+try {
+(function () {
+  const card = document.querySelector('#translateSection .tr-card');
+  const enable = document.getElementById('translate_enabled');
+  if (!card || !enable) return;
+  // The toggle works identically on the create and edit pages.
+  enable.addEventListener('change', () => card.classList.toggle('tr-collapsed', !enable.checked));
+  const seg = (name) => document.querySelector(`input[name="${name}"]:checked`)?.value;
+  const titleInput = document.getElementById('trTitle');
+  const descInput = document.getElementById('trDesc');
+  const titleRow = document.getElementById('trTitleRow');
+  const descRow = document.getElementById('trDescRow');
+  const statusEl = document.getElementById('trStatus');
+  const bar = document.querySelector('#trProgress > div');
+  const progressBox = document.getElementById('trProgress');
+  const logBox = document.getElementById('trLog');
+  let polling = null;
+
+  function showFlash(message, kind) {
+    let stack = document.querySelector('.toast-stack');
+    if (!stack) {
+      stack = document.createElement('div');
+      stack.className = 'toast-stack';
+      document.body.appendChild(stack);
+    }
+    const toast = document.createElement('div');
+    toast.className = 'toast toast-' + (kind || 'info');
+    toast.textContent = message;
+    toast.onclick = () => toast.remove();
+    stack.appendChild(toast);
+    setTimeout(() => toast.remove(), kind === 'error' ? 6000 : 3500);
+  }
+  window.showFlash = window.showFlash || showFlash;  // shared with the form autofill
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+  function goToAuth() {
+    // YouTube answered 403 Forbidden — the channel isn't authorized yet.
+    if (confirm('This YouTube channel is not authorized yet.\n' +
+                'Open the authorization page (Admin → Translation) now?')) {
+      location.href = '/admin/translator/connect';
+    }
+  }
+
+  // --- source fields: from video (read-only) vs manual (editable) ----------
+  // Reads the URL currently typed in the youtube_url field, so it works on
+  // the create page too (where nothing is saved yet).
+  async function fetchMeta(notify) {
+    const url = document.getElementById('youtube_url')?.value.trim();
+    if (!url) {
+      if (notify) showFlash('Paste the YouTube URL first', 'error');
+      return false;
+    }
+    try {
+      const r = await fetch('/api/yt_lookup?strict=1&url=' + encodeURIComponent(url),
+                            {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      const d = await r.json().catch(() => ({}));
+      if (d.needs_auth) { goToAuth(); return false; }
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      titleInput.value = d.title || '';
+      descInput.value = d.description || '';
+      if (notify) showFlash('Pulled the current title & description from YouTube', 'ok');
+      return true;
+    } catch (e) {
+      if (notify) showFlash('Fetch failed: ' + e.message, 'error');
+      return false;
+    }
+  }
+  function applyMode(initial) {
+    const fromVideo = seg('translate_source') === 'video';
+    // From video: fields show YouTube values and are locked against editing.
+    // Manual: same fields, freely editable.
+    titleInput.readOnly = fromVideo;
+    descInput.readOnly = fromVideo;
+    titleInput.classList.toggle('readonly', fromVideo);
+    descInput.classList.toggle('readonly', fromVideo);
+    // Pull fresh values from YouTube when entering the mode: on the initial
+    // page load only if nothing is saved yet (saves API quota), always on an
+    // explicit mode switch, and via the Fetch button anytime.
+    if (fromVideo && (initial ? !titleInput.value : true)) fetchMeta(!initial);
+  }
+  document.querySelectorAll('input[name="translate_source"]').forEach(
+    r => r.addEventListener('change', () => applyMode(false)));
+  // Fetch button: works on create AND edit — always reads the URL currently
+  // typed in the youtube_url field, not the saved one.
+  document.getElementById('trRefresh')?.addEventListener('click', async () => {
+    const url = document.getElementById('youtube_url')?.value.trim();
+    if (!url) { showFlash('Paste the YouTube URL first', 'error'); return; }
+    try {
+      const r = await fetch('/api/yt_lookup?strict=1&url=' + encodeURIComponent(url),
+                            {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      const d = await r.json().catch(() => ({}));
+      if (d.needs_auth) { goToAuth(); return; }
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      titleInput.value = d.title || '';
+      descInput.value = d.description || '';
+      showFlash('Pulled the current title & description from YouTube', 'ok');
+    } catch (e) {
+      showFlash('Fetch failed: ' + e.message, 'error');
+    }
+  });
+
+  // --- what to localize: hide the part that won't be touched ----------------
+  function applyParts() {
+    const p = seg('translate_parts');
+    // display:none keeps the input submitting its value — the translation
+    // still needs both texts as source context.
+    titleRow.style.display = (p === 'description') ? 'none' : '';
+    descRow.style.display = (p === 'title') ? 'none' : '';
+  }
+  document.querySelectorAll('input[name="translate_parts"]').forEach(
+    r => r.addEventListener('change', applyParts));
+  applyParts();   // apply the initial state before anything else can fail
+  applyMode(true);
+
+  // --- language chips -------------------------------------------------------
+  const chips = document.getElementById('trChips');
+  const langBoxes = [...document.querySelectorAll('#trLangs input')];
+  const byCode = Object.fromEntries(langBoxes.map(b => [b.value, b.closest('label').textContent.trim()]));
+  function renderChips() {
+    chips.innerHTML = '';
+    langBoxes.filter(b => b.checked).forEach(b => {
+      const chip = document.createElement('span');
+      chip.className = 'tr-chip';
+      chip.append(byCode[b.value]);
+      const x = document.createElement('button');
+      x.type = 'button'; x.textContent = '✕'; x.title = 'Remove';
+      x.onclick = () => { b.checked = false; renderChips(); };
+      chip.append(x);
+      chips.append(chip);
+    });
+    if (!langBoxes.some(b => b.checked)) {
+      chips.innerHTML = '<span class="hint">No languages selected yet — open the list below.</span>';
+    }
+  }
+  langBoxes.forEach(b => b.addEventListener('change', renderChips));
+  renderChips();
+
+  const preset = document.getElementById('trPreset');
+  const PRESETS = {{ tr_presets|tojson }};
+  const presetState = document.getElementById('trPresetState');
+  const selectedCodes = () => langBoxes.filter(b => b.checked).map(b => b.value);
+
+  function updatePresetState() {
+    const base = PRESETS[preset.value];
+    const dirty = !!base &&
+      JSON.stringify([...selectedCodes()].sort()) !== JSON.stringify([...base].sort());
+    presetState.style.display = dirty ? '' : 'none';
+  }
+  langBoxes.forEach(b => b.addEventListener('change', updatePresetState));
+  preset.addEventListener('change', updatePresetState);
+
+  async function savePreset(name, codes) {
+    const r = await fetch('/api/translator/preset/save', {
+      method: 'POST',
+      headers: {'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/json'},
+      body: JSON.stringify({name, codes})
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.message || 'HTTP ' + r.status);
+    PRESETS[name] = d.presets[name];
+    if (![...preset.options].some(o => o.value === name)) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name + ' (' + codes.length + ')';
+      preset.append(opt);
+    }
+    preset.value = name;
+    updatePresetState();
+  }
+
+  document.getElementById('trPresetApply').addEventListener('click', () => {
+    if (!preset.value) return showFlash('Pick a preset first', 'error');
+    const codes = PRESETS[preset.value] || [];
+    langBoxes.forEach(b => { b.checked = codes.includes(b.value); });
+    renderChips();
+    updatePresetState();
+  });
+  document.getElementById('trPresetSave').addEventListener('click', async () => {
+    const codes = selectedCodes();
+    if (!codes.length) return showFlash('Select at least one language first', 'error');
+    let name = preset.value;
+    if (!name) {  // nothing selected yet — behave like Save as
+      name = prompt('Preset name:');
+      if (!name || !name.trim()) return;
+      name = name.trim();
+    }
+    try {
+      await savePreset(name, codes);
+      showFlash('Preset "' + name + '" saved', 'ok');
+    } catch (e) { showFlash('Save preset: ' + e.message, 'error'); }
+  });
+  document.getElementById('trPresetSaveAs').addEventListener('click', async () => {
+    const codes = selectedCodes();
+    if (!codes.length) return showFlash('Select at least one language first', 'error');
+    const suggested = preset.value ? preset.value + ' copy' : 'My preset';
+    const name = prompt('Save as new preset:', suggested);
+    if (!name || !name.trim()) return;
+    try {
+      await savePreset(name.trim(), codes);
+      showFlash('Preset "' + name.trim() + '" saved', 'ok');
+    } catch (e) { showFlash('Save preset: ' + e.message, 'error'); }
+  });
+  document.getElementById('trPresetDelete').addEventListener('click', async () => {
+    if (!preset.value) return showFlash('Pick a preset first', 'error');
+    if (!confirm('Delete preset "' + preset.value + '"?')) return;
+    try {
+      const r = await fetch('/api/translator/preset/delete', {
+        method: 'POST',
+        headers: {'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/json'},
+        body: JSON.stringify({name: preset.value})
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.message || 'HTTP ' + r.status);
+      delete PRESETS[preset.value];
+      preset.options[preset.selectedIndex]?.remove();
+      preset.value = '';
+      updatePresetState();
+      showFlash('Preset deleted', 'ok');
+    } catch (e) { showFlash('Delete preset: ' + e.message, 'error'); }
+  });
+
+  const langsToggle = document.getElementById('trLangsToggle');
+  langsToggle.addEventListener('change', () =>
+    document.getElementById('trLangsWrap').classList.toggle('open', langsToggle.checked));
+
+  // --- run translation --------------------------------------------------------
+  function renderLog(entries) {
+    // Entries already carry a full human line ("✓ en-US — English (US): …").
+    logBox.innerHTML = entries.map(e =>
+      `<div class="k-${e.kind || 'info'}">${escapeHtml(e.detail)}</div>`).join('');
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  document.getElementById('trRun').addEventListener('click', async () => {
+    const btn = document.getElementById('trRun');
+    btn.disabled = true;
+    try {
+      // Save the form first so the job uses exactly what is on screen. On the
+      // create page this creates the stream; the redirect lands on /stream/<id>.
+      const form = btn.closest('form');
+      const saveResp = await fetch(form.action, {method: 'POST', body: new FormData(form)});
+      if (!saveResp.ok) throw new Error('save failed (HTTP ' + saveResp.status + ')');
+      const m = (saveResp.url || '').match(/\/stream\/(\d+)/);
+      if (!m) throw new Error('could not resolve the stream after saving');
+      const sid = m[1];
+      const r = await fetch(`/stream/translate/${sid}`,
+                            {method: 'POST', headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      const d = await r.json().catch(() => ({}));
+      if (d.needs_auth) { btn.disabled = false; goToAuth(); return; }
+      if (!r.ok || !d.ok) throw new Error(d.message || 'HTTP ' + r.status);
+      progressBox.style.display = 'block';
+      logBox.classList.add('open');
+      logBox.scrollIntoView({behavior: 'smooth', block: 'center'});
+      statusEl.textContent = `0 / ${d.total}`;
+      bar.style.width = '0%';
+      poll(sid);
+    } catch (e) {
+      showFlash('Translation: ' + e.message, 'error');
+      btn.disabled = false;
+    }
+  });
+
+  function poll(sid) {
+    if (polling) clearInterval(polling);
+    polling = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/translate_status/${sid}`,
+                              {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+        const d = await r.json();
+        bar.style.width = d.total ? Math.round(100 * d.done / d.total) + '%' : '0%';
+        statusEl.textContent = d.running ? `${d.done} / ${d.total} translating…`
+                                         : (d.error ? 'failed' : `${d.applied} applied`);
+        if (d.log && d.log.length) renderLog(d.log);
+        if (!d.running) {
+          clearInterval(polling); polling = null;
+          document.getElementById('trRun').disabled = false;
+          if (d.needs_auth) { goToAuth(); return; }
+          if (d.error) showFlash('Translation finished with errors: ' + d.error, 'error');
+          else if (d.applied) showFlash(d.applied + ' language(s) applied to the video', 'ok');
+        }
+      } catch (e) { /* transient */ }
+    }, 1500);
+  }
+
+  // initial state
+  applyParts();
+  applyMode(true);
+})();
+} catch (e) { window.__trLoadErr = e.message + ' @' + e.lineNumber; }
+</script>

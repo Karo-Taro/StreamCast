@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS streams (
     loop_queue    INTEGER DEFAULT 1,      -- 1 = repeat the queue forever (24/7)
     is_live       INTEGER DEFAULT 0,
     pid           INTEGER,                -- ffmpeg process id when live
+    live_since    REAL,                   -- unix ts when the live session started (survives restarts)
+    last_seen     REAL,                   -- unix ts of the last live heartbeat (lets resume skip downtime)
     scheduled_at  REAL,                   -- unix ts for a planned start, or NULL
     created_at    REAL NOT NULL,
     shuffle       INTEGER DEFAULT 0,      -- 1 = random play enabled
@@ -29,7 +31,14 @@ CREATE TABLE IF NOT EXISTS streams (
     music_volume  REAL DEFAULT 1.0,       -- music: playlist audio level (0..2)
     stream_volume REAL DEFAULT 1.0,       -- video: playback audio level (0..2)
     quality_mode  TEXT DEFAULT 'balanced', -- 'quality' | 'balanced' | 'performance'
-    last_error    TEXT DEFAULT ''          -- why the last session ended (survives restarts)
+    last_error    TEXT DEFAULT '',          -- why the last session ended (survives restarts)
+    channel_name TEXT DEFAULT '',
+    translate_enabled  INTEGER DEFAULT 0,     -- show/allow metadata localization for this stream
+    translate_parts    TEXT DEFAULT 'all',    -- 'all' | 'title' | 'description'
+    translate_source   TEXT DEFAULT 'video',  -- 'video' (take from YouTube) | 'manual'
+    translate_title    TEXT DEFAULT '',       -- manual source title
+    translate_description TEXT DEFAULT '',    -- manual source description
+    translate_languages TEXT DEFAULT '[]'     -- JSON array of target language codes
 );
 
 CREATE TABLE IF NOT EXISTS videos (
@@ -66,6 +75,14 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS storages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    path       TEXT,                   -- absolute root; NULL = the main storage (config.STORAGE_DIR)
+    is_default INTEGER DEFAULT 0,      -- new uploads land here first (when it has room)
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS stream_access (
@@ -111,6 +128,10 @@ def migrate_db():
             pass
         try:
             db.execute("ALTER TABLE streams ADD COLUMN stream_type TEXT DEFAULT 'video'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE streams ADD COLUMN channel_name TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
         try:
@@ -173,21 +194,67 @@ def migrate_db():
             db.execute("ALTER TABLE streams ADD COLUMN last_error TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        try:
+            db.execute("ALTER TABLE videos ADD COLUMN storage_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE videos ADD COLUMN encoded_storage_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE videos ADD COLUMN prev_encoded_storage_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE streams ADD COLUMN live_since REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE streams ADD COLUMN last_seen REAL")
+        except sqlite3.OperationalError:
+            pass
+        for col, ddl in (
+            ("translate_enabled", "INTEGER DEFAULT 0"),
+            ("translate_parts", "TEXT DEFAULT 'all'"),
+            ("translate_source", "TEXT DEFAULT 'video'"),
+            ("translate_title", "TEXT DEFAULT ''"),
+            ("translate_description", "TEXT DEFAULT ''"),
+            ("translate_languages", "TEXT DEFAULT '[]'"),
+        ):
+            try:
+                db.execute(f"ALTER TABLE streams ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
 
 def init_db():
     config.ensure_dirs()
     with get_db() as db:
         db.executescript(SCHEMA)
+        # migrate_db opens its own connection; it must run while this one has
+        # no open write transaction (executescript committed above), or its
+        # ALTERs block on the write lock and silently time out.
         migrate_db()
+        # The main storage is env-driven (config.STORAGE_DIR) and can never be
+        # deleted or renamed from the UI, hence the NULL path sentinel.
+        db.execute(
+            "INSERT OR IGNORE INTO storages (id, name, path, is_default, created_at) "
+            "VALUES (1, 'Main storage', NULL, 1, ?)",
+            (time.time(),),
+        )
 
 # --- Streams ----------------------------------------------------------------
-def create_stream(name, rtmp_key="", youtube_url="", stream_type="video",
-                  quality_mode="balanced", owner_id=None):
+def create_stream(name, channel_name="", rtmp_key="", youtube_url="", stream_type="video",
+                  quality_mode="balanced", owner_id=None, translate_enabled=0,
+                  translate_parts="all", translate_source="video", translate_title="",
+                  translate_description="", translate_languages="[]"):
     with get_db() as db:
         cur = db.execute(
-            "INSERT INTO streams (name, rtmp_key, youtube_url, stream_type, quality_mode, owner_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, rtmp_key, youtube_url, stream_type, quality_mode, owner_id, time.time()),
+            "INSERT INTO streams (name, channel_name, rtmp_key, youtube_url, stream_type, quality_mode, owner_id, created_at, "
+            "translate_enabled, translate_parts, translate_source, translate_title, translate_description, translate_languages) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, channel_name, rtmp_key, youtube_url, stream_type, quality_mode, owner_id, time.time(),
+             translate_enabled, translate_parts, translate_source, translate_title, translate_description, translate_languages),
         )
         return cur.lastrowid
 
@@ -248,20 +315,28 @@ def delete_stream(stream_id):
         db.execute("DELETE FROM streams WHERE id = ?", (stream_id,))
         db.execute("DELETE FROM stream_access WHERE stream_id = ?", (stream_id,))
 
-def set_live(stream_id, is_live, pid=None):
-    update_stream(stream_id, is_live=1 if is_live else 0, pid=pid)
+def set_live(stream_id, is_live, pid=None, live_since=None):
+    """Persist live state. live_since marks when the session started: callers
+    may pass the original timestamp to keep uptime continuous (auto-resume);
+    a fresh start leaves it None and 'now' is recorded."""
+    if is_live:
+        update_stream(stream_id, is_live=1, pid=pid,
+                      live_since=live_since if live_since is not None else time.time())
+    else:
+        update_stream(stream_id, is_live=0, pid=pid, live_since=None)
 
 # --- Videos -----------------------------------------------------------------
-def add_video(stream_id, orig_name, stored_name, kind="video"):
+def add_video(stream_id, orig_name, stored_name, kind="video", storage_id=1,
+              status="waiting_encode", encoded_name=None, encode_preset="balanced"):
     with get_db() as db:
         pos = db.execute(
             "SELECT COALESCE(MAX(position), -1) + 1 p FROM videos WHERE stream_id = ?",
             (stream_id,),
         ).fetchone()["p"]
         cur = db.execute(
-            "INSERT INTO videos (stream_id, orig_name, stored_name, kind, position, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (stream_id, orig_name, stored_name, kind, pos, time.time()),
+            "INSERT INTO videos (stream_id, orig_name, stored_name, kind, storage_id, position, created_at, status, encoded_name, encode_preset) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (stream_id, orig_name, stored_name, kind, storage_id, pos, time.time(), status, encoded_name, encode_preset),
         )
         return cur.lastrowid
 
@@ -408,3 +483,41 @@ def set_shared_streams(user_id, stream_ids):
                 "INSERT OR IGNORE INTO stream_access (user_id, stream_id) VALUES (?, ?)",
                 (user_id, int(sid)),
             )
+
+
+# --- Storages (upload targets; main storage is row 1 with path=NULL) ---------
+def list_storages():
+    """All storages, main first, extras in creation order."""
+    with get_db() as db:
+        return db.execute("SELECT * FROM storages ORDER BY id").fetchall()
+
+def get_storage(storage_id):
+    with get_db() as db:
+        return db.execute("SELECT * FROM storages WHERE id = ?", (storage_id,)).fetchone()
+
+def create_storage(name, path):
+    with get_db() as db:
+        cur = db.execute(
+            "INSERT INTO storages (name, path, created_at) VALUES (?, ?, ?)",
+            (name, path, time.time()),
+        )
+        return cur.lastrowid
+
+def set_default_storage(storage_id):
+    """Exactly one storage is the default; switch the flag atomically."""
+    with get_db() as db:
+        db.execute("UPDATE storages SET is_default = 0")
+        db.execute("UPDATE storages SET is_default = 1 WHERE id = ?", (storage_id,))
+
+def delete_storage(storage_id):
+    with get_db() as db:
+        db.execute("DELETE FROM storages WHERE id = ? AND path IS NOT NULL", (storage_id,))
+
+def count_videos_on_storage(storage_id):
+    """How many video rows reference this storage (any of their copies)."""
+    with get_db() as db:
+        return db.execute(
+            "SELECT COUNT(*) c FROM videos WHERE storage_id = ? "
+            "OR encoded_storage_id = ? OR prev_encoded_storage_id = ?",
+            (storage_id, storage_id, storage_id),
+        ).fetchone()["c"]

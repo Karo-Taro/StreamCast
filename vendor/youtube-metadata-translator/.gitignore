@@ -1,0 +1,11 @@
+# User data (keys, tokens, profiles, calendars, translations) never goes to git.
+data/*
+!data/local_llm.json
+
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+build/
+dist/
+*.spec

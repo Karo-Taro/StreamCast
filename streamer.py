@@ -15,6 +15,7 @@ no manual stop/start. `apply_now()` forces an immediate block restart.
 A watchdog restarts ffmpeg if it dies (network blip, YouTube reset), so the
 channel self-heals.
 """
+import logging
 import random
 import subprocess
 import threading
@@ -24,6 +25,7 @@ from collections import deque
 
 import config
 import db
+import storage
 
 
 def _has_audio_stream(path):
@@ -42,7 +44,7 @@ def _has_audio_stream(path):
 class _Runner:
     """Owns one ffmpeg process + watchdog for a single stream."""
 
-    def __init__(self, stream_id):
+    def __init__(self, stream_id, live_since=None):
         self.stream_id = stream_id
         self.proc = None
         self.playlist_path = None
@@ -62,8 +64,10 @@ class _Runner:
 
         # Live-session uptime (wall clock). Set once per runner start; block
         # rebuilds and watchdog restarts don't reset it. Reset on next start.
+        # _live_since keeps a resumed session's original start (auto-resume).
         self.session_started = None
         self.session_stopped = None
+        self._live_since = live_since
 
         # now-playing tracking (computed from wall-clock, since -re plays realtime)
         self._block_started = 0.0          # monotonic time the current block began
@@ -102,10 +106,11 @@ class _Runner:
             for v in videos_all:
                 if v["prev_encoded_name"]:
                     try:
-                        (config.ENCODED_DIR / v["prev_encoded_name"]).unlink(missing_ok=True)
+                        storage.video_encoded_path(v, v["prev_encoded_name"]).unlink(missing_ok=True)
                     except OSError:
                         pass
-                    db.update_video(v["id"], prev_encoded_name=None, prev_encode_preset=None)
+                    db.update_video(v["id"], prev_encoded_name=None, prev_encode_preset=None,
+                                    prev_encoded_storage_id=None)
             videos_all = db.list_videos(self.stream_id)
 
         def copy_name(v):
@@ -128,7 +133,8 @@ class _Runner:
             if loop_video is None:
                 self.last_error = "No loop video selected — upload a video and set it as the background"
                 return None, [], 0.0
-            self.loop_video_path = (config.ENCODED_DIR / copy_name(loop_video)).resolve()
+            self.loop_video_path = storage.video_encoded_path(
+                loop_video, copy_name(loop_video)).resolve()
             self._mix_video_audio = bool(
                 stream["mix_video_audio"] if "mix_video_audio" in stream.keys() else False
             )
@@ -177,7 +183,9 @@ class _Runner:
                         break
             prev_ids = [v["id"] for v in cycle] if is_shuffle else None
             for v in cycle:
-                path = (config.ENCODED_DIR / v["encoded_name"]).resolve()
+                # copy_name: while a mode switch re-encodes the queue, every
+                # entry plays its previous-quality copy (uniform block).
+                path = storage.video_encoded_path(v, copy_name(v)).resolve()
                 # Use a simpler replacement to avoid JS escaping issues
                 safe_path = str(path).replace('\\', '/').replace("'", "'\\''")
                 lines.append(f"file '{safe_path}'")
@@ -280,7 +288,7 @@ class _Runner:
         self.playlist_path, self._block_videos, self._block_total = pl, play_order, block_total
         self._stop.clear()
         self._reload.clear()
-        self.session_started = time.time()
+        self.session_started = self._live_since or time.time()
         self.session_stopped = None
         self._thread = threading.Thread(target=self._supervise, daemon=True)
         self._thread.start()
@@ -312,7 +320,8 @@ class _Runner:
         )
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self._block_started = time.monotonic()
-        db.set_live(self.stream_id, True, pid=self.proc.pid)
+        db.set_live(self.stream_id, True, pid=self.proc.pid,
+                    live_since=self.session_started)
 
     def _supervise(self):
         """Play the queue block by block, rebuilding between blocks."""
@@ -455,12 +464,12 @@ class StreamManager:
         self._sched_thread = None
         self._sched_stop = threading.Event()
 
-    def start_stream(self, stream_id):
+    def start_stream(self, stream_id, live_since=None):
         with self._lock:
             existing = self._runners.get(stream_id)
             if existing and existing.is_running():
                 return True, "Already live"
-            runner = _Runner(stream_id)
+            runner = _Runner(stream_id, live_since=live_since)
             ok = runner.start()
             if ok:
                 self._runners[stream_id] = runner
@@ -515,6 +524,53 @@ class StreamManager:
         }
 
     # -- scheduler -----------------------------------------------------------
+    def resume_interrupted(self):
+        """Restart streams that were live when the server went down.
+
+        The runner registry is memory-only, but streams.is_live is persisted:
+        a flag still set at boot means the user wanted that stream live. Only
+        call once, from bootstrap. Returns (resumed_ids, failed[(id, msg)]).
+        """
+        resumed, failed = [], []
+        for s in db.list_streams():
+            if not s.get("is_live"):
+                continue
+            live_since = s.get("live_since")
+            last_seen = s.get("last_seen")
+            if live_since and last_seen and live_since < last_seen <= time.time():
+                # The stream kept a heartbeat, so we know how long it actually
+                # streamed before the crash: shift the session start forward by
+                # the downtime instead of counting it as uptime.
+                live_since = time.time() - (last_seen - live_since)
+            # None (pre-feature flag) → start the uptime from now.
+            ok, msg = self.start_stream(s["id"], live_since=live_since or time.time())
+            if ok:
+                resumed.append(s["id"])
+            else:
+                # Clear the flag so a permanently broken stream doesn't linger
+                # as phantom-live; a transient failure just needs one click.
+                db.set_live(s["id"], False, pid=None)
+                failed.append((s["id"], msg, live_since))
+        if failed:
+            self._schedule_resume_retry(failed)
+        return resumed, failed
+
+    def _schedule_resume_retry(self, failed, delay=45.0):
+        """One background retry for streams that failed to resume — the usual
+        cause is the network not being up yet at boot. The is_live flag stays
+        cleared meanwhile, so the UI shows the stream as offline until it
+        actually starts."""
+        def _retry():
+            time.sleep(delay)
+            log = logging.getLogger("streamcast")
+            for sid, _first_msg, live_since in failed:
+                ok, msg = self.start_stream(sid, live_since=live_since or time.time())
+                if ok:
+                    log.info("Resumed stream %d on retry", sid)
+                else:
+                    log.warning("Stream %d still failed to resume: %s", sid, msg)
+        threading.Thread(target=_retry, daemon=True).start()
+
     def start_scheduler(self):
         if self._sched_thread and self._sched_thread.is_alive():
             return
@@ -526,6 +582,10 @@ class StreamManager:
         while not self._sched_stop.is_set():
             now = time.time()
             for s in db.list_streams():
+                if self.is_live(s["id"]):
+                    # Live heartbeat: lets a post-crash resume tell streamed
+                    # time from server downtime (see resume_interrupted).
+                    db.update_stream(s["id"], last_seen=now)
                 sched = s.get("scheduled_at")
                 if sched and sched <= now and not self.is_live(s["id"]):
                     db.update_stream(s["id"], scheduled_at=None)

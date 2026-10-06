@@ -1,0 +1,256 @@
+{# Translation tile: YouTube channel (OAuth), AI providers, parallelism, engine updates.
+   Self-contained: renders shell, pulls live data from /api/translator/settings. #}
+<style>
+  .tr-adm-sec { display:flex; flex-direction:column; gap:14px; margin-top:14px; }
+  .tr-label { font-size:12px; font-weight:700; letter-spacing:.06em; color:var(--muted); text-transform:uppercase; }
+  .tr-adm-row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .tr-adm-provider {
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    border:1px solid var(--border); border-radius:10px; padding:10px 12px;
+    background:var(--surface-2);
+  }
+  .tr-adm-provider .pname { font-weight:700; }
+  .tr-adm-provider .pmeta { font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+  .tr-adm-provider.active { border-color: var(--accent, #6d87ff); box-shadow: 0 0 0 1px var(--accent, #6d87ff) inset; }
+  .tr-adm-badge {
+    font-size:10.5px; font-weight:800; letter-spacing:.05em; border-radius:6px;
+    padding:2px 7px; background:rgba(109,135,255,.14); color:var(--accent, #6d87ff);
+  }
+  .tr-adm-badge.bad { background:rgba(217,83,79,.14); color:#d9534f; }
+  .tr-adm-editor {
+    display:none; flex-direction:column; gap:10px;
+    border:1px dashed var(--border-strong); border-radius:10px; padding:14px; background:var(--surface);
+  }
+  .tr-adm-editor.open { display:flex; }
+  .tr-adm-keys { font-size:12px; display:flex; flex-direction:column; gap:4px; }
+  .tr-adm-keys label { display:flex; gap:6px; align-items:center; }
+  .tr-adm-key-status { font-weight:700; }
+  .tr-adm-key-status.ok { color:#34c759; } .tr-adm-key-status.frozen { color:#f0a020; }
+  .tr-adm-key-status.nobalance { color:#f0a020; } .tr-adm-key-status.dead { color:#d9534f; }
+</style>
+
+<div class="card" id="translator">
+  <h2>Translation</h2>
+  <p class="hint" style="margin-top:-6px">
+    AI localization of video titles &amp; descriptions, powered by the bundled
+    <b>youtube-metadata-translator</b> engine. Per-stream settings live on each
+    stream's Edit page.
+  </p>
+
+  <div id="trAdmBody" class="tr-adm-sec">
+    <div class="hint">Loading…</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const body = document.getElementById('trAdmBody');
+  const H = {'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/json'};
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+  function toast(msg, kind) {
+    let stack = document.querySelector('.toast-stack');
+    if (!stack) { stack = document.createElement('div'); stack.className = 'toast-stack'; document.body.appendChild(stack); }
+    const t = document.createElement('div');
+    t.className = 'toast toast-' + (kind || 'info');
+    t.textContent = msg; t.onclick = () => t.remove();
+    stack.appendChild(t);
+    setTimeout(() => t.remove(), kind === 'error' ? 6000 : 3500);
+  }
+  async function api(url, payload) {
+    const r = await fetch(url, {method: 'POST', headers: H, body: JSON.stringify(payload || {})});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.message || 'HTTP ' + r.status);
+    return d;
+  }
+
+  // ---------- channel + engine + parallel sections (static shell) ----------
+  function channelHtml(st) {
+    const chans = st.channels || [];
+    const list = chans.length
+      ? chans.map((c, i) =>
+          `<div class="tr-adm-row" style="gap:8px;">
+             <span class="tr-adm-badge">${i === chans.length - 1 ? 'active' : 'connected'}</span>
+             <b>${esc(c.title || 'Unknown channel')}</b>
+             <span class="pmeta">${esc(c.id || '')}</span>
+           </div>`).join('')
+      : `<span class="tr-adm-badge bad">not connected</span> <span class="pmeta">upload your OAuth client secrets, then click Connect</span>`;
+    const secrets = DATA.has_secrets
+      ? `<form method="get" action="/admin/translator/connect" style="margin:0">
+           <button type="submit" class="btn btn-primary">Connect / reconnect channel</button>
+         </form>`
+      : `<form method="post" action="/admin/translator/secrets" enctype="multipart/form-data" style="margin:0; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+           <input type="file" name="secrets" accept=".json" required
+                  style="font:inherit; font-size:13px; color:var(--text);">
+           <button type="submit" class="btn btn-primary">Upload client_secrets.json</button>
+         </form>`;
+    return `<div class="tr-adm-row"><span class="tr-label">YouTube channels</span></div>
+            <div style="display:flex; flex-direction:column; gap:6px;">${list}</div>
+            <div class="tr-adm-row">${secrets}</div>
+            <p class="hint" style="margin:0">The last connected channel is used for translations.
+               The OAuth redirect is <code>${location.origin}/oauth2callback</code> —
+               add it to the authorized redirect URIs of your Google Cloud OAuth client.</p>`;
+  }
+
+  function engineHtml() {
+    const v = DATA.vendored || {};
+    return `<div class="tr-adm-row"><span class="tr-label">Engine</span></div>
+      <div class="tr-adm-row">
+        <span class="pmeta">Vendored: <b>${esc(v.sha || 'unknown')}</b>${v.date ? ' · ' + esc(v.date.slice(0, 10)) : ''}</span>
+        <span class="pmeta" id="trLatest"></span>
+        <form method="post" action="/admin/translator/update" style="margin:0">
+          <button type="submit" class="btn">↻ Update from GitHub</button>
+        </form>
+      </div>`;
+  }
+
+  function parallelHtml(d) {
+    const p = d.parallel || {};
+    return `<div class="tr-adm-row"><span class="tr-label">Parallelism</span></div>
+      <div class="tr-adm-row">
+        <input id="trParallel" class="admin-input" style="width:120px;" value="${esc(p.value ?? 'auto')}" placeholder="auto">
+        <button type="button" class="btn" id="trParallelSave">Save</button>
+        <span class="hint" style="margin:0">auto = one thread per API key (suggested: ${esc(p.suggested ?? 1)})</span>
+      </div>`;
+  }
+
+  // ---------- providers ----------
+  let REG = null;
+  let editingId = null;
+
+  function providerRow(p) {
+    const active = REG.active === p.id;
+    const alert = (DATA.alerts || {})[p.id];
+    return `<div class="tr-adm-provider ${active ? 'active' : ''}" data-id="${esc(p.id)}">
+      <div style="flex:1; min-width:180px;">
+        <div class="pname">${esc(p.name)} ${active ? '<span class="tr-adm-badge">active</span>' : ''}
+          ${alert ? `<span class="tr-adm-badge bad" title="${esc(alert.detail || '')}">⚠ out of balance (${esc(alert.seen)})</span>` : ''}
+          <span class="pmeta">· ${esc(p.kind)}${p.auth ? '' : ' · no key'} · keys: ${p.key_count}</span></div>
+        <div class="pmeta">${esc(p.base_url || '—')} · model: ${esc(p.model || '—')}</div>
+      </div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        ${active ? '' : `<button type="button" class="btn" onclick="trAct('${esc(p.id)}')">Make active</button>`}
+        <button type="button" class="btn" onclick="trEdit('${esc(p.id)}')">Edit</button>
+        <button type="button" class="btn" style="color:#d9534f;" onclick="trDel('${esc(p.id)}')">✕</button>
+      </div>
+    </div>`;
+  }
+
+  function editorHtml(p) {
+    p = p || {name: '', kind: 'openai', base_url: '', model: '', keys_masked: []};
+    return `<div class="tr-adm-editor open" id="trEditor">
+      <div class="tr-adm-row">
+        <input id="trName" class="admin-input" style="flex:1; min-width:140px;" placeholder="Name" value="${esc(p.name)}">
+        <select id="trKind" class="admin-input" style="width:140px;">
+          <option value="openai" ${p.kind === 'openai' ? 'selected' : ''}>OpenAI-compatible</option>
+          <option value="gemini" ${p.kind === 'gemini' ? 'selected' : ''}>Gemini</option>
+        </select>
+        <input id="trModel" class="admin-input" style="width:170px;" placeholder="Model" value="${esc(p.model || '')}">
+      </div>
+      <input id="trBase" class="admin-input" placeholder="Base URL (e.g. https://openrouter.ai/api/v1)" value="${esc(p.base_url || '')}">
+      ${p.keys_masked && p.keys_masked.length ? `<div class="tr-adm-keys"><b>Existing keys</b>
+        ${p.keys_masked.map(k => `<label><input type="checkbox" class="tr-keep" value="${esc(k)}" checked> keep ${esc(k)}</label>`).join('')}
+      </div>` : ''}
+      <textarea id="trKeys" class="admin-input" rows="2"
+                placeholder="New API keys — separate with spaces or commas"></textarea>
+      <div class="tr-adm-row">
+        <button type="button" class="btn btn-primary" id="trSave">Save provider</button>
+        <button type="button" class="btn" id="trCheck">Check keys</button>
+        <button type="button" class="btn" onclick="document.getElementById('trEditor').remove()">Cancel</button>
+      </div>
+      <div class="tr-adm-keys" id="trKeyResults"></div>
+    </div>`;
+  }
+
+  window.trEdit = function (id) {
+    document.getElementById('trEditor')?.remove();
+    const p = REG.providers.find(x => x.id === id);
+    editingId = id || null;
+    document.getElementById('trProviders').insertAdjacentHTML('afterend', editorHtml(p));
+    document.getElementById('trSave').onclick = saveProvider;
+    document.getElementById('trCheck').onclick = checkKeys;
+  };
+  window.trAct = async function (id) {
+    try { REG = (await api('/api/translator/provider/activate', {id})).registry; render(); }
+    catch (e) { toast(e.message, 'error'); }
+  };
+  window.trDel = async function (id) {
+    if (!confirm('Delete this provider?')) return;
+    try { REG = (await api('/api/translator/provider/delete', {id})).registry; render(); }
+    catch (e) { toast(e.message, 'error'); }
+  };
+
+  async function saveProvider() {
+    const keep = [...document.querySelectorAll('.tr-keep:checked')].map(c => c.value);
+    const entry = {name: document.getElementById('trName').value.trim(),
+                   kind: document.getElementById('trKind').value,
+                   base_url: document.getElementById('trBase').value.trim(),
+                   model: document.getElementById('trModel').value.trim()};
+    // New providers are key-based; when editing, the server keeps the stored
+    // auth flag untouched (e.g. LM Studio stays key-less).
+    if (!editingId) { entry.auth = true; } else { entry.id = editingId; }
+    try {
+      const d = await api('/api/translator/provider/save',
+                          {entry, keep, new_keys: document.getElementById('trKeys').value});
+      REG = d.registry; editingId = null; render();
+      toast('Provider saved', 'ok');
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
+  async function checkKeys() {
+    if (!editingId) { toast('Save the provider first', 'error'); return; }
+    const out = document.getElementById('trKeyResults');
+    out.innerHTML = '<div class="hint">Checking…</div>';
+    try {
+      const d = await api('/api/translator/provider/check_keys', {provider_id: editingId});
+      out.innerHTML = d.keys.map(k =>
+        `<div><span class="tr-adm-key-status ${k.status}">${k.status}</span> ${esc(k.masked)} ${k.detail ? '· ' + esc(k.detail) : ''}</div>`
+      ).join('') || '<div class="hint">No keys configured.</div>';
+    } catch (e) { out.innerHTML = ''; toast(e.message, 'error'); }
+  }
+
+  function render() {
+    body.innerHTML = `
+      ${channelHtml(DATA.status)}
+      ${parallelHtml(DATA)}
+      <div class="tr-adm-row"><span class="tr-label">AI providers</span>
+        <button type="button" class="btn" onclick="trEdit(null)" style="margin-left:auto;">+ Add provider</button></div>
+      <div id="trProviders" style="display:flex; flex-direction:column; gap:8px;">
+        ${REG.providers.map(providerRow).join('') || '<div class="hint">No providers yet.</div>'}
+      </div>
+      ${engineHtml()}`;
+    document.getElementById('trParallelSave').onclick = async () => {
+      try {
+        await api('/api/translator/parallel', {value: document.getElementById('trParallel').value.trim()});
+        toast('Parallelism saved', 'ok');
+      } catch (e) { toast(e.message, 'error'); }
+    };
+  }
+
+  async function loadLatest(st) {
+    try {
+      const r = await fetch('https://api.github.com/repos/ErrorGone-YT/youtube-metadata-translator/commits/main');
+      if (!r.ok) return;
+      const d = await r.json();
+      const el = document.getElementById('trLatest');
+      if (el) el.innerHTML = `Latest on GitHub: <b>${esc(d.sha.slice(0, 7))}</b> · ${esc(d.commit.committer.date.slice(0, 10))}`;
+    } catch (e) { /* offline / rate limit — just skip */ }
+  }
+
+  let DATA = null;
+  (async () => {
+    try {
+      const r = await fetch('/api/translator/settings', {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      DATA = await r.json();
+      if (!DATA.ok) throw new Error(DATA.message || 'engine unavailable');
+      REG = DATA.registry || {active: null, providers: []};
+      render();
+      loadLatest(DATA.status);
+    } catch (e) {
+      body.innerHTML = `<div class="hint" style="color:#d9534f">Translation engine unavailable: ${esc(e.message)}</div>`;
+    }
+  })();
+})();
+</script>

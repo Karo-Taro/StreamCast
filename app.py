@@ -1,11 +1,14 @@
 """StreamCast — single-owner 24/7 YouTube streaming panel."""
+import json
 import logging
+import psutil
+import threading
 from logging.handlers import RotatingFileHandler
 import re
 import secrets
-import shutil
 import subprocess
 import time
+import shutil
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -20,6 +23,8 @@ from werkzeug.utils import secure_filename
 
 import config
 import db
+import storage
+import translator_bridge
 from encoder import ffprobe_info, terminate_job, worker as encoder_worker
 from streamer import manager
 
@@ -81,19 +86,19 @@ def _youtube_id(url):
     return m.group(1) if m else None
 
 
-def _thumb_path(encoded_name):
+def _thumb_path(video):
     """Thumbnail sits next to the encoded file: xxx.mp4 -> xxx.mp4.jpg."""
-    return config.ENCODED_DIR / (encoded_name + ".jpg")
+    return storage.video_thumb_path(video)
 
 
 def _ensure_thumb(video):
     """Grab a frame from an encoded video if its thumbnail doesn't exist yet."""
     if not video["encoded_name"] or video["kind"] == "audio":
         return
-    thumb = _thumb_path(video["encoded_name"])
+    thumb = _thumb_path(video)
     if thumb.exists():
         return
-    src = config.ENCODED_DIR / video["encoded_name"]
+    src = storage.video_encoded_path(video)
     if not src.exists():
         return
     try:
@@ -143,11 +148,11 @@ def _hydrate_media_meta(v):
         updates["width"] = None
         updates["height"] = None
     if not v["size"]:
-        p = config.ENCODED_DIR / v["encoded_name"]
+        p = storage.video_encoded_path(v)
         if p.exists():
             updates["size"] = p.stat().st_size
     if not v["width"] and v.get("kind") != "audio":
-        src = config.UPLOAD_DIR / v["stored_name"]
+        src = storage.video_upload_path(v)
         if src.exists():
             try:
                 _, _, w, h = ffprobe_info(src)
@@ -161,6 +166,14 @@ def _hydrate_media_meta(v):
 
 
 app = Flask(__name__)
+@app.route('/api/system_load')
+def api_system_load():
+    """Current system-wide CPU and RAM usage."""
+    try:
+        import psutil
+        return jsonify({'cpu': psutil.cpu_percent(interval=0.1), 'ram': psutil.virtual_memory().percent})
+    except Exception as e:
+        return jsonify({'cpu': 0, 'ram': 0, 'error': str(e)}), 500
 app.config["SECRET_KEY"] = config.SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = config.MAX_UPLOAD_MB * 1024 * 1024
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -493,8 +506,21 @@ def admin_panel():
     created = session.pop("created_password", None)
     streams = db.list_streams()
     shared = {u["id"]: set(db.list_shared_stream_ids(u["id"])) for u in users}
+    storages_ui = []
+    for row in db.list_storages():
+        st = storage.disk_status(row)
+        storages_ui.append({
+            "id": row["id"], "name": row["name"],
+            "path": str(storage.root(row)),
+            "is_main": row["path"] is None,
+            "is_default": bool(row["is_default"]),
+            "files": db.count_videos_on_storage(row["id"]),
+            **st,
+        })
     return render_template("admin.html", users=users, created=created,
-                           roles=ROLES, streams=streams, shared=shared)
+                           roles=ROLES, streams=streams, shared=shared,
+                           storages=storages_ui,
+                           min_free_gb=config.MIN_FREE_GB)
 
 
 @app.route("/admin/users", methods=["POST"])
@@ -551,6 +577,59 @@ def admin_delete_user(user_id):
     return redirect(url_for("admin_panel"))
 
 
+# --- Storages (admin: extra upload targets, e.g. an external SSD) ------------
+@app.route("/admin/storages/scan", methods=["GET"])
+@admin_required
+def admin_scan_storages():
+    """Scan system for available disks/mounts to help the admin pick a path."""
+    disks = storage.scan_available_disks()
+    return jsonify(disks)
+
+
+@app.route("/admin/storages", methods=["POST"])
+@admin_required
+def admin_add_storage():
+    try:
+        path = storage.validate_new_storage(
+            request.form.get("name", ""), request.form.get("path", ""))
+    except storage.StorageError as e:
+        flash(str(e), "error")
+        return redirect(url_for("admin_panel"))
+    db.create_storage(request.form.get("name", "").strip(), path)
+    flash(f"Storage added: {path}", "ok")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/storages/<int:storage_id>/default", methods=["POST"])
+@admin_required
+def admin_default_storage(storage_id):
+    if not db.get_storage(storage_id):
+        abort(404)
+    db.set_default_storage(storage_id)
+    flash("Default storage updated — new uploads go there while it has room", "ok")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/storages/<int:storage_id>/delete", methods=["POST"])
+@admin_required
+def admin_delete_storage(storage_id):
+    row = db.get_storage(storage_id)
+    if not row:
+        abort(404)
+    if row["path"] is None:
+        flash("The main storage cannot be removed", "error")
+        return redirect(url_for("admin_panel"))
+    used = db.count_videos_on_storage(storage_id)
+    if used:
+        flash(f"Storage «{row['name']}» still holds {used} file(s) — "
+              f"delete them from the queue first", "error")
+        return redirect(url_for("admin_panel"))
+    db.delete_storage(storage_id)
+    # The files stay on disk; re-adding the same path brings everything back.
+    flash(f"Storage «{row['name']}» removed (files on disk were not touched)", "ok")
+    return redirect(url_for("admin_panel"))
+
+
 # --- Dashboard --------------------------------------------------------------
 @app.route("/")
 @login_required
@@ -567,14 +646,17 @@ def dashboard():
         s["yt_id"] = _youtube_id(s["youtube_url"])
         s["thumb_url"] = _stream_thumb_url(s)
         s["can_manage"] = _owns_stream(s)
-    # Disk holding the storage dir: exact free/total in GB for the dashboard bar.
-    usage = shutil.disk_usage(config.STORAGE_DIR)
-    disk = {
-        "free_gb": usage.free / 1024 ** 3,
-        "total_gb": usage.total / 1024 ** 3,
-        "used_pct": round(100 * usage.used / usage.total, 1) if usage.total else 0,
-    }
-    return render_template("dashboard.html", streams=streams, disk=disk,
+    # Per-storage free/total for the dashboard strip (main storage first).
+    storages_ui = []
+    for row in db.list_storages():
+        st = storage.disk_status(row)
+        storages_ui.append({
+            "id": row["id"], "name": row["name"],
+            "path": str(storage.root(row)),
+            "is_default": bool(row["is_default"]),
+            **st,
+        })
+    return render_template("dashboard.html", streams=streams, storages=storages_ui,
                            encoding_count=db.count_encoding_videos())
 
 
@@ -593,16 +675,28 @@ def stream_create():
         if quality_mode not in config.QUALITY_MODES:
             quality_mode = "balanced"
         uid, _ = current_user()
+        channel_name = request.form.get("channel_name", "").strip()
+        languages = [l for l in request.form.getlist("translate_languages") if l]
+        parts = request.form.get("translate_parts", "all")
+        source = request.form.get("translate_source", "video")
         sid = db.create_stream(
             name,
+            channel_name=channel_name,
             rtmp_key=request.form.get("rtmp_key", "").strip(),
             youtube_url=request.form.get("youtube_url", "").strip(),
             stream_type=stream_type,
             quality_mode=quality_mode,
             owner_id=uid,  # None for the master/admin: owned by the panel itself
+            translate_enabled=1 if request.form.get("translate_enabled") else 0,
+            translate_parts=parts if parts in ("all", "title", "description") else "all",
+            translate_source=source if source in ("video", "manual") else "video",
+            translate_title=request.form.get("translate_title", "").strip(),
+            translate_description=request.form.get("translate_description", "").strip(),
+            translate_languages=json.dumps(languages),
         )
         return redirect(url_for("stream_detail", stream_id=sid))
-    return render_template("stream_edit.html", stream=None, current_mode="balanced")
+    return render_template("stream_edit.html", stream=None, current_mode="balanced",
+                           **_translate_page_data(None))
 
 
 @app.route("/stream/<int:stream_id>")
@@ -649,19 +743,33 @@ def stream_edit(stream_id):
         quality_mode = request.form.get("quality_mode", stream["quality_mode"] or "balanced")
         if quality_mode not in config.QUALITY_MODES:
             quality_mode = stream["quality_mode"] or "balanced"
+        languages = [l for l in request.form.getlist("translate_languages") if l]
+        parts = request.form.get("translate_parts", "all")
+        source = request.form.get("translate_source", "video")
         db.update_stream(
             stream_id,
             name=request.form.get("name", "").strip() or stream["name"],
+            channel_name=request.form.get("channel_name", "").strip() or stream.get("channel_name", ""),
             rtmp_key=request.form.get("rtmp_key", "").strip(),
             youtube_url=request.form.get("youtube_url", "").strip(),
             loop_queue=1 if request.form.get("loop_queue") else 0,
             quality_mode=quality_mode,
+            translate_enabled=1 if request.form.get("translate_enabled") else 0,
+            translate_parts=parts if parts in ("all", "title", "description") else "all",
+            translate_source=source if source in ("video", "manual") else "video",
+            translate_title=request.form.get("translate_title", "").strip(),
+            translate_description=request.form.get("translate_description", "").strip(),
+            translate_languages=json.dumps(languages),
         )
         if quality_mode != (stream["quality_mode"] or "balanced"):
             # Re-encode the queue into the new mode in the background; files
             # keep playing their previous-quality copies until each is done.
             for v in db.list_videos(stream_id):
                 if v["status"] == "completed" and (v["encode_preset"] or "balanced") != quality_mode:
+                    # Fast-imported files have no source upload — nothing to
+                    # re-encode; they stay as they are.
+                    if not storage.video_upload_path(v).exists():
+                        continue
                     db.update_video(v["id"], status="waiting_encode", progress=0.0, error_msg="")
             manager.apply_now(stream_id)
             flash("Quality mode changed — the queue is being re-encoded in the background", "ok")
@@ -671,7 +779,496 @@ def stream_edit(stream_id):
     return render_template(
         "stream_edit.html", stream=stream,
         current_mode=stream["quality_mode"] or "balanced",
+        **_translate_page_data(stream),
     )
+
+
+# --- Metadata localization (vendored youtube-metadata-translator) -----------
+
+def _translate_page_data(stream):
+    """Template context for the localization section of the edit page."""
+    languages = []
+    if stream:
+        try:
+            languages = json.loads(stream["translate_languages"] or "[]")
+        except ValueError:
+            pass
+    data = {
+        "tr_ready": translator_bridge.ready(),
+        "tr_error": translator_bridge.load_error,
+        "tr_channel": None,
+        "tr_catalog": {},
+        "tr_presets": {},
+        "tr_languages": languages,
+    }
+    if data["tr_ready"]:
+        status = translator_bridge.status()
+        data["tr_channel"] = status["channel"]
+        data["tr_catalog"] = translator_bridge.language_catalog()
+        data["tr_presets"] = translator_bridge.language_presets()
+    return data
+
+
+def _is_auth_error(message):
+    """YouTube API 'Forbidden' — the connected account can't manage this video
+    (or the API isn't enabled for the project). Needs (re-)authorization."""
+    message = str(message)
+    return "403" in message and "forbidden" in message.lower()
+
+
+def _translation_video_id(stream):
+    return _youtube_id(stream["youtube_url"] or "")
+
+
+@app.route("/stream/translate_preview/<int:stream_id>")
+@login_required
+@ajax_required
+def translate_preview(stream_id):
+    """Current source title/description the translation would start from."""
+    _owned_stream(stream_id)
+    stream = db.get_stream(stream_id)
+    if not stream:
+        abort(404)
+    if (stream["translate_source"] or "video") == "manual":
+        return jsonify({"source": "manual",
+                        "title": stream["translate_title"] or "",
+                        "description": stream["translate_description"] or ""})
+    video_id = _translation_video_id(stream)
+    if not video_id:
+        return jsonify({"error": "No YouTube URL on this stream"}), 400
+    try:
+        meta = translator_bridge.fetch_video_meta(video_id)
+    except Exception as e:
+        logging.getLogger("streamcast").warning("Preview fetch for stream %d failed: %s",
+                                                stream_id, e)
+        return jsonify({"error": str(e)[:200], "needs_auth": _is_auth_error(e)}), 502
+    return jsonify({"source": "video", "video_id": video_id,
+                    "title": meta.get("title", ""),
+                    "description": meta.get("description", "")})
+
+
+_TRANSLATION_JOBS = {}          # stream_id -> job dict
+_TRANSLATION_JOBS_LOCK = threading.Lock()
+
+
+def _translation_worker(stream_id, video_id, title, description, languages, parts):
+    job = _TRANSLATION_JOBS[stream_id]
+    log = logging.getLogger("streamcast")
+    catalog = translator_bridge.language_catalog()
+    provider_id = None
+    try:
+        provider_id = ((translator_bridge.engine.get_active_provider() or {}) .get("id"))
+    except Exception:
+        pass
+
+    def progress(kind, lang, detail=""):
+        name = catalog.get(lang, lang) if lang else ""
+        with _TRANSLATION_JOBS_LOCK:
+            if kind == "ok":
+                job["done"] += 1
+                line = f"✓ {lang} — {name}: translation applied"
+            elif kind == "fail":
+                line = f"✗ {lang} — {name}: failed — {str(detail)[:120]}"
+            elif kind == "retry":
+                is_balance = "402" in str(detail) or "insufficient" in str(detail).lower()
+                if is_balance and provider_id:
+                    translator_bridge.set_provider_alert(
+                        provider_id, "nobalance", f"HTTP 402 during translation ({lang})")
+                marker = "⚠" if is_balance else "⟳"
+                line = f"{marker} {lang} — {name}: {str(detail)[:100]} — retrying…"
+            else:
+                line = str(detail)[:160]
+            job["log"].append({"kind": kind, "lang": lang, "detail": line})
+            job["log"] = job["log"][-200:]
+
+    try:
+        result = translator_bridge.run_translation(
+            title, description, languages, parts, progress=progress)
+        if result["localizations"]:
+            with _TRANSLATION_JOBS_LOCK:
+                job["log"].append({"kind": "info", "lang": "",
+                                   "detail": f"▸ Applying {len(result['localizations'])} "
+                                             f"localization(s) to the video…"})
+            translator_bridge.update_video_localizations(
+                video_id, title, description, "en", result["localizations"])
+        applied = list(result["localizations"])
+        with _TRANSLATION_JOBS_LOCK:
+            job["done"] = len(applied)
+            job["running"] = False
+            job["error"] = "; ".join(result["errors"]) if result["errors"] else ""
+            job["applied"] = len(applied)
+            for code in applied:
+                job["log"].append({"kind": "ok", "lang": code,
+                                   "detail": f"✓ {code} — {catalog.get(code, code)}: "
+                                             f"applied to the video"})
+            if result["errors"]:
+                job["log"].append({"kind": "fail", "lang": "",
+                                   "detail": f"✗ {len(result['errors'])} language(s) failed — "
+                                             f"the rest were applied"})
+        log.info("Translation for stream %d applied %d/%d language(s)",
+                 stream_id, len(applied), len(languages))
+    except Exception as e:
+        log.warning("Translation for stream %d failed: %s", stream_id, e)
+        with _TRANSLATION_JOBS_LOCK:
+            job["running"] = False
+            job["error"] = str(e)[:300]
+            job["needs_auth"] = _is_auth_error(e)
+            job["log"].append({"kind": "fail", "lang": "",
+                               "detail": f"✗ failed — {str(e)[:140]}"})
+
+
+@app.route("/stream/translate/<int:stream_id>", methods=["POST"])
+@login_required
+@ajax_required
+def stream_translate(stream_id):
+    _owned_stream(stream_id)
+    stream = db.get_stream(stream_id)
+    if not stream:
+        abort(404)
+    if not translator_bridge.ready():
+        return jsonify({"ok": False, "message": translator_bridge.load_error}), 400
+    video_id = _translation_video_id(stream)
+    if not video_id:
+        return jsonify({"ok": False, "message": "No YouTube URL on this stream"}), 400
+    if (stream["translate_source"] or "video") == "manual":
+        title = (stream["translate_title"] or "").strip()
+        description = (stream["translate_description"] or "").strip()
+        if not title:
+            return jsonify({"ok": False, "message": "Manual source title is empty"}), 400
+    else:
+        try:
+            meta = translator_bridge.fetch_video_meta(video_id)
+        except Exception as e:
+            return jsonify({"ok": False, "message": f"Cannot fetch video: {e}",
+                            "needs_auth": _is_auth_error(e)}), 502
+        title = meta.get("title", "")
+        description = meta.get("description", "")
+    try:
+        languages = json.loads(stream["translate_languages"] or "[]")
+    except ValueError:
+        languages = []
+    if not languages:
+        return jsonify({"ok": False, "message": "No target languages selected"}), 400
+
+    with _TRANSLATION_JOBS_LOCK:
+        old = _TRANSLATION_JOBS.get(stream_id)
+        if old and old["running"]:
+            return jsonify({"ok": False, "message": "A translation is already running"}), 409
+        provider_name = None
+        try:
+            provider_name = (translator_bridge.engine.get_active_provider() or {}).get("name")
+        except Exception:
+            pass
+        _TRANSLATION_JOBS[stream_id] = {
+            "running": True, "done": 0, "total": len(languages),
+            "applied": 0, "error": "", "started": time.time(),
+            "video_id": video_id,
+            "log": [{"kind": "info", "lang": "",
+                     "detail": f"▸ Starting translation into {len(languages)} language(s): "
+                               f"{', '.join(languages)}"
+                               + (f" — provider: {provider_name}" if provider_name else "")}],
+        }
+        job = _TRANSLATION_JOBS[stream_id]
+    parts = stream["translate_parts"] or "all"
+    threading.Thread(target=_translation_worker,
+                     args=(stream_id, video_id, title, description, languages, parts),
+                     daemon=True).start()
+    return jsonify({"ok": True, "total": len(languages)})
+
+
+@app.route("/api/translate_status/<int:stream_id>")
+@login_required
+@ajax_required
+def translate_status(stream_id):
+    _owned_stream(stream_id)
+    with _TRANSLATION_JOBS_LOCK:
+        job = _TRANSLATION_JOBS.get(stream_id)
+        return jsonify(job or {"running": False, "done": 0, "total": 0,
+                               "applied": 0, "error": "", "log": []})
+
+
+@app.route("/api/yt_lookup")
+@login_required
+@ajax_required
+def yt_lookup():
+    """Title/channel/description lookup for a YouTube URL. Default mode is
+    best-effort ({} on any failure) for the form autofill; ?strict=1 returns
+    real errors so the localization Fetch button can show and route them."""
+    video_id = _youtube_id(request.args.get("url", ""))
+    strict = request.args.get("strict") == "1"
+    if not video_id:
+        if strict:
+            return jsonify({"error": "Not a YouTube video URL"}), 400
+        return jsonify({})
+    if not translator_bridge.ready() or translator_bridge.get_youtube_client() is None:
+        if strict:
+            return jsonify({"error": "YouTube channel is not connected",
+                            "needs_auth": True}), 502
+        return jsonify({})
+    try:
+        return jsonify(translator_bridge.video_lookup(video_id))
+    except Exception as e:
+        if strict:
+            return jsonify({"error": str(e)[:200],
+                            "needs_auth": _is_auth_error(e)}), 502
+        return jsonify({})
+
+
+def _admin_guard():
+    if current_role() != "admin":
+        abort(403)
+
+
+@app.route("/admin/translator/secrets", methods=["POST"])
+@login_required
+def admin_translator_secrets():
+    _admin_guard()
+    file = request.files.get("secrets")
+    if not file or not file.filename:
+        flash("Choose a client_secrets file first", "error")
+        return redirect(url_for("admin_panel"))
+    try:
+        translator_bridge.save_secrets(file.read())
+        flash("OAuth client secrets saved", "ok")
+    except Exception as e:
+        flash(f"Rejected: {e}", "error")
+    return redirect(url_for("admin_panel") + "#translator")
+
+
+@app.route("/admin/translator/connect")
+@login_required
+def admin_translator_connect():
+    """Start the Google OAuth flow with a redirect back to this site."""
+    _admin_guard()
+    if not translator_bridge.ready():
+        flash(translator_bridge.load_error or "Translator engine unavailable", "error")
+        return redirect(url_for("admin_panel"))
+    if not translator_bridge.has_secrets():
+        flash("Upload the OAuth client secrets JSON first", "error")
+        return redirect(url_for("admin_panel") + "#translator")
+    try:
+        from google_auth_oauthlib.flow import Flow
+    except ImportError:
+        flash("google-auth-oauthlib is not installed (see requirements.txt)", "error")
+        return redirect(url_for("admin_panel"))
+    eng = translator_bridge.engine
+    with open(translator_bridge.os.path.join(
+            translator_bridge.data_dir(), "client_secrets.json"), encoding="utf-8") as f:
+        client_config = json.load(f)
+    redirect_uri = (config.SITE_URL or request.url_root.rstrip("/")) + "/oauth2callback"
+    flow = Flow.from_client_config(client_config, scopes=eng.SCOPES,
+                                   redirect_uri=redirect_uri)
+    auth_url, state = flow.authorization_url(
+        access_type="offline", include_granted_scopes="false", prompt="consent")
+    session["oauth_state"] = state
+    return redirect(auth_url)
+
+
+@app.route("/oauth2callback")
+@login_required
+def oauth2callback():
+    _admin_guard()
+    eng = translator_bridge.engine
+    if eng is None:
+        abort(404)
+    if request.args.get("error"):
+        flash(f"Google returned: {request.args['error']}", "error")
+        return redirect(url_for("admin_panel") + "#translator")
+    if request.args.get("code") is None or "oauth_state" not in session:
+        abort(400)
+    try:
+        from google_auth_oauthlib.flow import Flow
+        import googleapiclient.discovery
+        import pickle
+        redirect_uri = (config.SITE_URL or request.url_root.rstrip("/")) + "/oauth2callback"
+        with open(translator_bridge.os.path.join(
+                translator_bridge.data_dir(), "client_secrets.json"), encoding="utf-8") as f:
+            client_config = json.load(f)
+        flow = Flow.from_client_config(client_config, scopes=eng.SCOPES,
+                                       redirect_uri=redirect_uri, state=session["oauth_state"])
+        flow.fetch_token(authorization_response=request.url)
+        credentials = flow.credentials
+        # A token file per connect, so several channels can stay authorized.
+        token_file = f"oauth_token_{uuid.uuid4().hex[:8]}.pickle"
+        with open(translator_bridge.os.path.join(
+                translator_bridge.data_dir(), token_file), "wb") as f:
+            pickle.dump(credentials, f)
+        profiles = eng.load_channel_profiles()
+        profile = {"id": f"channel_{uuid.uuid4().hex[:6]}", "name": "Channel",
+                   "token_file": token_file,
+                   "client_secrets_file": "client_secrets.json",
+                   "playlists": [], "default_playlists": []}
+        profiles["profiles"].append(profile)
+        youtube = googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+        eng.refresh_profile_identity(youtube, profile, profiles)
+        # One profile per channel: reconnecting the same channel replaces its
+        # old entry instead of piling up duplicates.
+        profiles["profiles"] = [p for p in profiles["profiles"]
+                                if p is profile or p.get("channel_id") != profile.get("channel_id")]
+        eng.save_channel_profiles(profiles)
+        translator_bridge._yt_clients.clear()  # force client rebuilds for new tokens
+        flash(f"YouTube channel connected: {profile.get('channel_title', '')}", "ok")
+    except Exception as e:
+        logging.getLogger("streamcast").warning("OAuth connect failed: %s", e)
+        flash(f"YouTube connect failed: {str(e)[:200]}", "error")
+    session.pop("oauth_state", None)
+    return redirect(url_for("admin_panel") + "#translator")
+
+
+def _translator_api(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        _admin_guard()
+        if not translator_bridge.ready():
+            return jsonify({"ok": False, "message": translator_bridge.load_error}), 400
+        return view(*args, **kwargs)
+    return wrapped
+
+
+@app.route("/api/translator/settings")
+@login_required
+@ajax_required
+def translator_settings():
+    _admin_guard()
+    vendored = translator_bridge.vendored_version()
+    return jsonify({
+        "ok": True,
+        "status": translator_bridge.status(),
+        "has_secrets": translator_bridge.has_secrets(),
+        "registry": translator_bridge.provider_registry_view(),
+        "parallel": translator_bridge.parallelism(),
+        "vendored": vendored,
+        "alerts": translator_bridge.get_provider_alerts(),
+    })
+
+
+@app.route("/api/translator/provider/save", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_provider_save():
+    data = request.get_json() or {}
+    entry = data.get("entry") or {}
+    if not entry.get("name"):
+        return jsonify({"ok": False, "message": "Provider name is required"}), 400
+    import hashlib
+    reg = translator_bridge.provider_registry()
+    keep = set(data.get("keep", []))
+    new_keys = [k for k in re.split(r"[,\s]+", str(data.get("new_keys", ""))) if k]
+    clean = {k: v for k, v in entry.items()
+             if k in ("id", "name", "kind", "base_url", "model", "auth")}
+    existing = next((p for p in reg["providers"] if p["id"] == clean.get("id")), None)
+    if existing:
+        if existing.get("auth"):
+            merged = [k for k in existing.get("api_keys", [])
+                      if hashlib.sha1(k.encode()).hexdigest()[:10] in keep] + new_keys
+        else:
+            merged = []
+        existing.update(clean)
+        existing["api_keys"] = merged
+    else:
+        eng = translator_bridge.engine
+        clean["id"] = eng.profile_slug(clean["name"], {p["id"] for p in reg["providers"]})
+        clean["api_keys"] = new_keys
+        reg["providers"].append(clean)
+        reg.setdefault("active", clean["id"])
+    translator_bridge.save_provider_registry(reg)
+    return jsonify({"ok": True, "registry": translator_bridge.provider_registry_view()})
+
+
+@app.route("/api/translator/provider/activate", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_provider_activate():
+    data = request.get_json() or {}
+    reg = translator_bridge.provider_registry()
+    if data.get("id") not in {p["id"] for p in reg["providers"]}:
+        return jsonify({"ok": False, "message": "Unknown provider"}), 400
+    reg["active"] = data["id"]
+    translator_bridge.save_provider_registry(reg)
+    return jsonify({"ok": True, "registry": translator_bridge.provider_registry_view()})
+
+
+@app.route("/api/translator/provider/delete", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_provider_delete():
+    data = request.get_json() or {}
+    reg = translator_bridge.provider_registry()
+    reg["providers"] = [p for p in reg["providers"] if p["id"] != data.get("id")]
+    if reg.get("active") not in {p["id"] for p in reg["providers"]}:
+        reg["active"] = reg["providers"][0]["id"] if reg["providers"] else None
+    translator_bridge.save_provider_registry(reg)
+    return jsonify({"ok": True, "registry": translator_bridge.provider_registry_view()})
+
+
+@app.route("/api/translator/provider/check_keys", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_provider_check_keys():
+    provider_id = (request.get_json() or {}).get("provider_id")
+    try:
+        keys = translator_bridge.check_provider_keys(provider_id)
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+    # A fully healthy check clears a live "out of balance" alert for the provider.
+    if keys and all(k["status"] == "ok" for k in keys):
+        translator_bridge.clear_provider_alert(provider_id)
+    return jsonify({"ok": True, "keys": keys})
+
+
+@app.route("/api/translator/parallel", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_parallel():
+    value = (request.get_json() or {}).get("value", "auto")
+    try:
+        saved = translator_bridge.set_parallelism(value)
+    except ValueError:
+        return jsonify({"ok": False, "message": "Invalid value"}), 400
+    return jsonify({"ok": True, "parallel": translator_bridge.parallelism(),
+                    "saved": saved})
+
+
+@app.route("/api/translator/preset/save", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_preset_save():
+    data = request.get_json() or {}
+    name = str(data.get("name") or "").strip()
+    codes = [c for c in (data.get("codes") or []) if c]
+    if not name or not codes:
+        return jsonify({"ok": False, "message": "Name and at least one language are required"}), 400
+    translator_bridge.save_preset(name, codes)
+    return jsonify({"ok": True, "presets": translator_bridge.language_presets()})
+
+
+@app.route("/api/translator/preset/delete", methods=["POST"])
+@login_required
+@ajax_required
+@_translator_api
+def translator_preset_delete():
+    name = str((request.get_json() or {}).get("name") or "").strip()
+    translator_bridge.delete_preset(name)
+    return jsonify({"ok": True, "presets": translator_bridge.language_presets()})
+
+
+@app.route("/admin/translator/update", methods=["POST"])
+@login_required
+def admin_translator_update():
+    _admin_guard()
+    try:
+        info = translator_bridge.update_vendor()
+        flash(f"Translator engine updated to {info['sha']}", "ok")
+    except Exception as e:
+        logging.getLogger("streamcast").warning("Vendor update failed: %s", e)
+        flash(f"Update failed: {str(e)[:200]}", "error")
+    return redirect(url_for("admin_panel") + "#translator")
 
 
 @app.route("/stream/delete/<int:stream_id>", methods=["POST"])
@@ -770,25 +1367,56 @@ def _unlink_retry(path, attempts=3, delay=0.4):
 
 def _remove_video_files(video):
     if video["stored_name"]:
-        _unlink_retry(config.UPLOAD_DIR / video["stored_name"])
+        _unlink_retry(storage.video_upload_path(video))
     if video["encoded_name"]:
-        _unlink_retry(config.ENCODED_DIR / video["encoded_name"])
-        _unlink_retry(_thumb_path(video["encoded_name"]))
+        _unlink_retry(storage.video_encoded_path(video))
+        _unlink_retry(_thumb_path(video))
+
+
+def _do_save_file(fileobj, stored_name, targets):
+    """Save an upload to the first storage that works. The pre-checked order
+    is default-first; if a disk still runs out mid-write (stale free-space
+    numbers, concurrent uploads), the partial file is dropped and the next
+    storage gets the whole file from the start. Returns the storage row."""
+    last_err = None
+    for row in targets:
+        try:
+            fileobj.stream.seek(0)  # a previous attempt may have consumed part of it
+            fileobj.save(storage.upload_dir(row) / stored_name)
+            return row
+        except OSError as e:
+            last_err = e
+            try:
+                (storage.upload_dir(row) / stored_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+    raise last_err if last_err else OSError("no storage available")
 
 
 @app.route("/upload/<int:stream_id>", methods=["POST"])
 @login_required
 def upload(stream_id):
     _owned_stream(stream_id)
-    stream = db.get_stream(stream_id)
-    if not stream:
+    curr_stream = db.get_stream(stream_id)
+    if not curr_stream:
         abort(404)
-    is_music = stream["stream_type"] == "music"
+    
+    is_music = curr_stream["stream_type"] == "music"
     files = request.files.getlist("video")
-    added = 0
+    
+    # Лимит места
+    needed_space = (request.content_length or 0) * 2
+    storage_targets = storage.upload_targets(needed=needed_space)
+    
+    added_count = 0
+    # Проверяем флаг быстрого импорта
+    is_fast = request.form.get("already_encoded") == "on"
+    stream_quality_mode = curr_stream["quality_mode"] or "balanced"
+    
     for f in files:
         if not f or not f.filename:
             continue
+        
         ext = Path(f.filename).suffix.lower()
         if ext in config.ALLOWED_EXT:
             kind = "video"
@@ -797,14 +1425,69 @@ def upload(stream_id):
         else:
             flash(f"{f.filename}: unsupported type", "error")
             continue
-        stored = f"{uuid.uuid4().hex}{ext}"
-        f.save(config.UPLOAD_DIR / stored)
-        db.add_video(stream_id, f.filename, stored, kind=kind)
-        added += 1
-    if added:
-        flash(f"{added} file(s) queued for encoding", "ok")
-    return redirect(url_for("stream_detail", stream_id=stream_id))
+            
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        
+        try:
+            if is_fast:
+                # БЫСТРЫЙ ПУТЬ: файл уже нормализован локальным энкодером —
+                # пишем сразу в encoded/ без ffmpeg. Тот же fallback по дискам,
+                # что и у обычной загрузки.
+                if not storage_targets:
+                    raise OSError("no storage available")
+                res_row = storage_targets[0]
+                target_path = storage.encoded_dir(res_row) / stored_name
+                with open(target_path, "wb") as out_f:
+                    shutil.copyfileobj(f.stream, out_f)
+                status_val = "completed"
+                encoded_name_val = stored_name
+                if kind == "video" and ext != ".mp4":
+                    flash(f"{f.filename}: not an .mp4 — the stream expects files "
+                          f"pre-encoded by the local encoder", "error")
+            else:
+                # ОБЫЧНЫЙ ПУТЬ: через _do_save_file (бывший _save_upload)
+                res_row = _do_save_file(f, stored_name, storage_targets)
+                status_val = "waiting_encode"
+                encoded_name_val = None
 
+            # Метаданные, которые при обычном энкодинге проставляет encoder.py,
+            # — иначе у тайла нет размера, бейджа и длительности.
+            duration, fps, w, h = 0, 0.0, None, None
+            try:
+                duration, fps, w, h = ffprobe_info(target_path)
+            except Exception:
+                pass
+            if is_fast and kind == "video" and fps and fps >= config.MAX_FPS:
+                target_path.unlink(missing_ok=True)
+                flash(f"{f.filename}: {fps:.0f}fps rejected (max {config.MAX_FPS - 1}fps)", "error")
+                continue
+
+            video_id = db.add_video(stream_id, f.filename, stored_name, kind=kind,
+                         storage_id=res_row["id"], status=status_val,
+                         encoded_name=encoded_name_val, encode_preset=stream_quality_mode)
+            added_count += 1
+
+            updates = {"duration": duration}
+            try:
+                updates["size"] = target_path.stat().st_size
+            except OSError:
+                pass
+            if kind == "video":
+                updates["width"], updates["height"] = w, h
+            db.update_video(video_id, **updates)
+            if is_fast:
+                _ensure_thumb(db.get_video(video_id))
+
+        except Exception as e:
+            logging.getLogger("streamcast").exception(f"Upload error: {e}")
+            flash(f"{f.filename}: upload failed", "error")
+            continue
+            
+    if added_count:
+        msg = f"{added_count} file(s) ready" if is_fast else f"{added_count} file(s) queued for encoding"
+        flash(msg, "ok")
+        
+    return redirect(url_for("stream_detail", stream_id=stream_id))
 
 @app.route("/video/set_loop/<int:video_id>", methods=["POST"])
 @login_required
@@ -881,7 +1564,7 @@ def video_file(video_id):
     if not video or not video["encoded_name"]:
         abort(404)
     _owned_stream(video["stream_id"])
-    path = config.ENCODED_DIR / video["encoded_name"]
+    path = storage.video_encoded_path(video)
     if not path.exists():
         abort(404)
     mime = "audio/mpeg" if video["kind"] == "audio" else "video/mp4"
@@ -913,7 +1596,7 @@ def video_thumb(video_id):
     video = db.get_video(video_id)
     if not video or not video["encoded_name"] or video["kind"] == "audio":
         abort(404)
-    thumb = _thumb_path(video["encoded_name"])
+    thumb = _thumb_path(video)
     if not thumb.exists():
         _ensure_thumb(video)
         if not thumb.exists():
@@ -1041,7 +1724,10 @@ def _sweep_orphan_files():
                 referenced.add(name)
                 referenced.add(name + ".jpg")
     removed = 0
-    for d in (config.UPLOAD_DIR, config.ENCODED_DIR):
+    dirs = []
+    for row in db.list_storages():
+        dirs += (storage.upload_dir(row), storage.encoded_dir(row))
+    for d in dirs:
         if not d.exists():
             continue
         for f in d.iterdir():
@@ -1055,10 +1741,21 @@ def _sweep_orphan_files():
         logging.getLogger("streamcast").info("Swept %d orphaned storage file(s)", removed)
 
 
+@login_required
+@app.route('/admin/storage/default/<int:storage_id>', methods=['POST'])
+@login_required
+def admin_set_default_storage(storage_id):
+    if current_role() != 'admin':
+        abort(403)
+    db.set_default_storage(storage_id)
+    flash('Default storage updated', 'ok')
+    return redirect(url_for('admin'))
+
 def bootstrap():
     config.ensure_dirs()
     _setup_logging()
     db.init_db()
+    storage.ensure_all()
     if config.SECRET_KEY == "dev-secret-change-me":
         # Safe default for self-hosters who never set STREAMCAST_SECRET: mint a
         # random key once and keep it in the DB so sessions survive restarts.
@@ -1072,6 +1769,13 @@ def bootstrap():
     _sweep_orphan_files()
     encoder_worker.start()
     manager.start_scheduler()
+    if config.AUTO_RESUME:
+        log = logging.getLogger("streamcast")
+        resumed, failed = manager.resume_interrupted()
+        for sid in resumed:
+            log.info("Resumed stream %d (was live before restart)", sid)
+        for sid, msg in failed:
+            log.warning("Could not resume stream %d: %s", sid, msg)
     logging.getLogger("streamcast").info("StreamCast started")
 
 

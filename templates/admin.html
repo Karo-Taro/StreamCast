@@ -83,6 +83,124 @@
 </div>
 
 <div class="card">
+  <h2>Storages</h2>
+  <p class="hint" style="margin-top:-6px">
+    Where uploads and encoded copies live. The default storage takes new files
+    first; when it has less than {{ min_free_gb }} GB free, uploads and encodes
+    automatically continue on the others (most free space wins).
+    An unplugged disk shows as <b>offline</b> — nothing is deleted, plug it back
+    in and its files return.
+  </p>
+
+  <form method="post" action="{{ url_for('admin_add_storage') }}"
+        style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:14px 0 18px;">
+    <input name="name" class="admin-input" style="flex:1; min-width:160px;"
+           placeholder="Name (e.g. External SSD)" required>
+    <div style="display:flex; gap:8px; flex:2; min-width:240px;">
+      <input name="path" id="storagePath" class="admin-input" style="flex:1;"
+             placeholder="Absolute path (/mnt/ssd, E:\Video)" required>
+      <button type="button" class="btn" onclick="scanDisks()" title="Scan for available disks">🔍</button>
+    </div>
+    <button type="submit" class="btn btn-primary">+ Add storage</button>
+  </form>
+  
+  <div id="diskScanner" style="display:none; background:var(--bg-strong); border:1px solid var(--border); border-radius:10px; padding:12px; margin-bottom:18px; font-size:13px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+      <b style="font-size:14px;">Available Disks</b>
+      <button type="button" class="btn" style="padding:2px 8px; font-size:11px;" onclick="document.getElementById('diskScanner').style.display='none'">✕ Close</button>
+    </div>
+    <div id="diskList" style="display:flex; flex-direction:column; gap:6px; max-height:200px; overflow-y:auto;">
+      <div class="hint" style="text-align:center; padding:10px;">Scanning...</div>
+    </div>
+  </div>
+
+  {% if storages %}
+  <div style="display:flex; flex-direction:column; gap:10px;">
+    {% for s in storages %}
+    <div class="storage-row {{ 'offline' if not s.ok }}">
+      <div class="storage-info">
+        <div class="storage-name">
+          {{ s.name }}
+          {% if s.is_default %}<span class="storage-badge">default</span>{% endif %}
+          {% if not s.ok %}<span class="storage-badge badge-offline">offline</span>{% endif %}
+        </div>
+        <div class="storage-path" title="{{ s.path }}">{{ s.path }} · {{ s.files }} file(s)</div>
+      </div>
+      {% if s.ok %}
+      <div class="disk-bar" style="max-width:220px;">
+        <div class="disk-bar-fill {{ 'low' if s.used_pct >= 90 else ('warn' if s.used_pct >= 75) }}"
+             style="width: {{ s.used_pct }}%;"></div>
+      </div>
+      <span class="disk-label">{{ '%.1f'|format(s.free_gb) }} GB free of {{ '%.1f'|format(s.total_gb) }} GB</span>
+      {% else %}
+      <span class="//disk-label" style="color:#d9534f;">cannot read this path</span>
+      {% endif %}
+      
+      <div class="user-actions">
+        {% if not s.is_default %}
+        <form method="post" action="{{ url_for('admin_default_storage', storage_id=s.id) }}" style="margin:0; display:flex;">
+          <button type="submit" class="btn" title="New uploads go here first while it has room">Make default</button>
+        </form>
+        {% endif %}
+        {% if not s.is_main %}
+        <form method="post" action="{{ url_for('admin_delete_storage', storage_id=s.id) }}"
+              style="margin:0; display:flex;"
+              onsubmit="return confirm('Remove storage «{{ s.name }}» from the panel? Files on disk are not deleted.');">
+          <button type="submit" class="btn" style="color:#d9534f;" title="Remove from the panel">✕</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty" style="padding:24px">No extra storages yet — the main one handles everything.</div>
+  {% endif %}
+</div>
+
+{% include '_admin_translation.html' %}
+
+<script>
+async function scanDisks() {
+  const scanner = document.getElementById('diskScanner');
+  const list = document.getElementById('diskList');
+  scanner.style.display = 'block';
+  list.innerHTML = '<div class="hint" style="text-align:center; padding:10px;">Scanning...</div>';
+  
+  try {
+    const r = await fetch('/admin/storages/scan');
+    const disks = await r.json();
+    if (!disks || disks.length === 0) {
+      list.innerHTML = '<div class="hint" style="text-align:center; padding:10px;">No other disks found.</div>';
+      return;
+    }
+    list.innerHTML = '';
+    disks.forEach(d => {
+      const row = document.createElement('div');
+      row.style = "display:flex; justify-content:space-between; align-items:center; padding:6px 10px; border:1px solid var(--border); border-radius:6px; cursor:pointer; transition:background .2s;";
+      row.onmouseover = () => row.style.background = 'rgba(109,135,255,.05)';
+      row.onmouseout = () => row.style.background = 'transparent';
+      row.onclick = () => {
+        document.getElementById('storagePath').value = d.path;
+        scanner.style.display = 'none';
+      };
+      row.innerHTML = `
+        <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:60%;">
+          <b>${d.name}</b><br><span style="font-size:11px; color:var(--muted)">${d.path}</span>
+        </div>
+        <div style="text-align:right; font-size:12px; color:var(--muted);">
+          ${d.free_gb.toFixed(1)} GB free<br>of ${d.total_gb.toFixed(1)} GB
+        </div>
+      `;
+      list.appendChild(row);
+    });
+  } catch (e) {
+    list.innerHTML = '<div class="hint" style="text-align:center; padding:10px; color:#d9534f;">Error scanning disks.</div>';
+  }
+}
+</script>
+
+<div class="card">
   <h2>Master password</h2>
   <p class="hint" style="margin-top:-6px">
     Signs in as the full owner. Setting it here overrides the STREAMCAST_PASSWORD env value.

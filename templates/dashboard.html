@@ -2,10 +2,61 @@
 {% block title %}Streams — StreamCast{% endblock %}
 
 {% block body %}
-<script>
-  // Apply the saved thumbnail preference before the grid paints (no flash).
-  try { if (localStorage.getItem('sc-thumbs') === '0') document.body.classList.add('no-thumbs'); } catch (e) {}
-</script>
+<style>
+  .sys-status-container {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+    align-items: start;
+  }
+  @media (max-width: 768px) {
+    .sys-status-container {
+      grid-template-columns: 1fr;
+    }
+  }
+  .sys-card {
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 15px;
+    margin: 0;
+  }
+  .sys-bar-bg {
+    height: 8px;
+    width: 100%;
+    background: var(--border-strong);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .sys-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent, #007bff);
+    transition: width 0.5s ease;
+    border-radius: 4px;
+  }
+  .filter-btn.active {
+    opacity: 1;
+    font-weight: 600;
+  }
+  .filter-btn:not(.active) {
+    opacity: 0.7;
+  }
+  #stream-search:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(59,91,253,.14);
+  }
+  @media (max-width: 600px) {
+    #stream-search {
+      width: 100%;
+      min-width: 0;
+      margin-left: 0;
+    }
+  }
+</style>
+
 <div class="page-head">
   <div>
     <h1>Your streams</h1>
@@ -14,218 +65,187 @@
   <a href="{{ url_for('stream_create') }}" class="btn btn-primary">+ New stream</a>
 </div>
 
-<div class="disk-strip" title="Free space on the disk that holds storage/">
-  <div class="disk-bar">
-    <div class="disk-bar-fill {{ 'low' if disk.used_pct >= 90 else ('warn' if disk.used_pct >= 75) }}"
-         style="width: {{ disk.used_pct }}%;"></div>
+<div class="sys-status-container">
+  <!-- Left Column: System Load -->
+  <div class="sys-card">
+    <div style="font-weight:600; margin-bottom:15px; font-size:14px;">System Load</div>
+    <div style="display:flex; flex-direction:column; gap:12px;">
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:12px; font-weight:600;">
+          <span>⚙️ CPU</span>
+          <span id="sys-cpu-val">--%</span>
+        </div>
+        <div class="sys-bar-bg">
+          <div id="sys-cpu-bar" class="sys-bar-fill"></div>
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:12px; font-weight:600;">
+          <span>📦 RAM</span>
+          <span id="sys-ram-val">--%</span>
+        </div>
+        <div class="sys-bar-bg">
+          <div id="sys-ram-bar" class="sys-bar-fill"></div>
+        </div>
+      </div>
+    </div>
   </div>
-  <span class="disk-label">{{ '%.1f'|format(disk.free_gb) }} GB free of {{ '%.1f'|format(disk.total_gb) }} GB</span>
-  <span id="encodeChip" class="encode-chip" title="Files being normalized right now" {% if not encoding_count %}hidden{% endif %}>🎞 {{ encoding_count }} encoding</span>
+
+  <!-- Right Column: Disk Space -->
+  <div style="display:flex; flex-direction:column; gap:8px;">
+    {% for s in storages %}
+    <div class="disk-strip" title="Free space on {{ s.path }}">
+      {% if storages|length > 1 or not s.is_default %}
+      <span class="disk-label" style="min-width:110px; overflow:hidden; text-overflow:ellipsis;" title="{{ s.name }}">
+        {% if s.is_default %}★ {% endif %}{{ s.name|truncate(16) }}
+      </span>
+      {% endif %}
+      {% if s.ok %}
+      <div class="disk-bar">
+        <div class="disk-bar-fill {{ 'low' if s.used_pct >= 90 else ('warn' if s.used_pct >= 75) }}"
+             style="width: {{ s.used_pct }}%;"></div>
+      </div>
+      <span class="disk-label">{{ '%.1f'|format(s.free_gb) }} GB free of {{ '%.1f'|format(s.total_gb) }} GB</span>
+      {% else %}
+      <div class="disk-bar"><div class="disk-bar-fill low" style="width:100%;"></div></div>
+      <span class="disk-label" style="color:#d9534f;">offline — plug the disk back in</span>
+      {% endif %}
+      {% if loop.last %}
+      <span id="encodeChip" class="encode-chip" title="Files being normalized right now" {% if not encoding_count %}hidden{% endif %}>🎞 {{ encoding_count }} encoding</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
 </div>
 
 {% if streams %}
-
 <div style="display:flex; gap:8px; margin:20px 0; flex-wrap:wrap; align-items:center;">
-
-  <button type="button" class="btn filter-btn" data-filter="live">
-    🟢 Live
-  </button>
-
-  <button type="button" class="btn filter-btn" data-filter="offline">
-    ⚪ Offline
-  </button>
-
-  <button type="button" class="btn filter-btn" data-filter="music">
-    🎵 Music
-  </button>
-
-  <button type="button" class="btn filter-btn" data-filter="video">
-    🎬 Video
-  </button>
-
-  <button type="button" class="btn filter-btn" id="filterReset" title="Clear filters and search">
-    ✕ Reset
-  </button>
-
-  <input
-    type="search"
-    id="stream-search"
-    placeholder="Search streams..."
-    autocomplete="off"
-    style="
-      margin-left:auto;
-      min-width:220px;
-      padding:9px 12px;
-      border-radius:8px;
-      border:1px solid var(--border-strong);
-      background:var(--surface);
-      color:var(--text);
-      caret-color:var(--text);
-      font:inherit;
-      outline:none;
-    "
-  >
-
+  <button type="button" class="btn filter-btn" data-filter="live">🟢 Live</button>
+  <button type="button" class="btn filter-btn" data-filter="offline">⚪ Offline</button>
+  <button type="button" class="btn filter-btn" data-filter="music">🎵 Music</button>
+  <button type="button" class="btn filter-btn" data-filter="video">🎬 Video</button>
+  <button type="button" class="btn filter-btn" id="filterReset" title="Clear filters and search">✕ Reset</button>
+  <input type="search" id="stream-search" placeholder="Search streams..." autocomplete="off"
+         style="margin-left:auto; min-width:220px; padding:9px 12px; border-radius:8px; border:1px solid var(--border-strong); background:var(--surface); color:var(--text); caret-color:var(--text); font:inherit; outline:none;">
   <label class="thumb-toggle" title="Show or hide stream thumbnails">
     🖼 Thumbnails
     <span class="switch">
-      <input type="checkbox" id="thumbToggle" checked>
+      <input type="checkbox" id="thumbToggle" {% if request.cookies.get('sc-thumbs') != '0' %}checked{% endif %}>
       <span class="slider round"></span>
     </span>
   </label>
-
 </div>
 
 <div class="grid" id="streams-grid">
-
   {% for s in streams %}
   <div class="stream-card stream-item"
        data-status="{{ 'live' if s.live else 'offline' }}"
        data-type="{{ s.stream_type }}"
        data-name="{{ s.name|lower }}"
-       data-all="{{ (s.name ~ ' ' ~ s.stream_type ~ ' ' ~ ('live' if s.live else 'offline') ~ ' ' ~ (s.resolution or '') ~ ' ' ~ s.video_count ~ ' ' ~ ('tracks' if s.stream_type == 'music' else 'videos') ~ ' ' ~ (s.runtime_label or '') ~ ' ' ~ (s.size_label or '') ~ ' ' ~ ('scheduled' if s.scheduled_at else '')) | lower }}">
-
+       data-all="{{ (s.channel_name ~ ' ' ~ s.name ~ ' ' ~ s.stream_type ~ ' ' ~ ('live' if s.live else 'offline') ~ ' ' ~ (s.resolution or '') ~ ' ' ~ s.video_count ~ ' ' ~ ('tracks' if s.stream_type == 'music' else 'videos') ~ ' ' ~ (s.runtime_label or '') ~ ' ' ~ (s.size_label or '') ~ ' ' ~ ('scheduled' if s.scheduled_at else '')) | lower }}">
     <div class="row">
       <span class="pill {{ 'pill-live' if s.live else 'pill-off' }}">
         <span class="pdot"></span>{{ 'LIVE' if s.live else 'OFFLINE' }}
       </span>
-      <span class="tile-timer muted" data-uptime="{{ s.uptime or 0 }}"
-            title="Session uptime"
+      <span class="tile-timer muted" data-uptime="{{ s.uptime or 0 }}" title="Session uptime"
             style="font-size:12.5px; font-variant-numeric:tabular-nums;"
             {% if not (s.live and s.uptime) %}hidden{% endif %}>{{ (s.uptime or 0)|hms }}</span>
-
-
       <span class="spacer"></span>
-
       {% if s.scheduled_at %}
         <span class="muted" style="font-size:12px">scheduled</span>
       {% endif %}
-
       {% if s.resolution %}<span class="qres {{ 'qres-max' if s.quality_mode == 'quality' }}" title="{{ 'Max quality mode' if s.quality_mode == 'quality' else 'Stream resolution' }}">{% if s.quality_mode == 'quality' %}✦ {% endif %}{{ s.resolution }}</span>{% endif %}
-
-      <!-- iOS-style live switch: right = on air, left = offline -->
       {% if s.can_manage %}
-      <form method="POST"
-            action="{{ url_for('stream_stop' if s.live else 'stream_start', stream_id=s.id, next='dashboard') }}"
-            style="margin:0; display:flex;">
-        <button type="submit"
-                class="live-switch {{ 'on' if s.live }}"
-                role="switch"
-                aria-checked="{{ 'true' if s.live else 'false' }}"
-                title="{{ 'Stop streaming' if s.live else 'Go live' }}"></button>
+      <form method="POST" action="{{ url_for('stream_stop' if s.live else 'stream_start', stream_id=s.id, next='dashboard') }}" style="margin:0; display:flex;">
+        <button type="submit" class="live-switch {{ 'on' if s.live }}" role="switch" aria-checked="{{ 'true' if s.live else 'false' }}" title="{{ 'Stop streaming' if s.live else 'Go live' }}"></button>
       </form>
       {% endif %}
     </div>
-
-    {% if s.yt_id or s.thumb_url %}
     <div class="tile-thumb">
+      <div class="tile-ph" aria-hidden="true">🎬</div>
       {% if s.yt_id %}
       <img src="https://i.ytimg.com/vi/{{ s.yt_id }}/hqdefault.jpg" alt="" loading="lazy"
-           onerror="if(!this.dataset.fb){this.dataset.fb=1;this.src='{{ s.thumb_url or '' }}';}else{this.closest('.tile-thumb').classList.add('hide');}">
-      {% else %}
-      <img src="{{ s.thumb_url }}" alt="" loading="lazy"
-           onerror="this.closest('.tile-thumb').classList.add('hide');">
+           onerror="if(!this.dataset.fb){this.dataset.fb=1;this.src='{{ s.thumb_url or '' }}';}else{this.style.display='none';}">
+      {% elif s.thumb_url %}
+      <img src="{{ s.thumb_url }}" alt="" loading="lazy" onerror="this.style.display='none';">
       {% endif %}
     </div>
+    <a href="{{ url_for('stream_detail', stream_id=s.id) }}" class="name">{{ s.name }}</a>
+    {% if s.channel_name %}
+    <div class="channel-name" style="font-size:13px; color:var(--muted); margin-top:4px;">📺 {{ s.channel_name }}</div>
     {% endif %}
-
-    <a href="{{ url_for('stream_detail', stream_id=s.id) }}"
-       class="name"
-       style="margin-top:12px">
-      {{ s.name }}
-    </a>
-
     <div class="stream-meta">
-      <span>
-        {{ s.video_count }} {{ 'track' if s.stream_type == 'music' else 'video' }}{{ '' if s.video_count == 1 else 's' }}
-      </span>
+      <span>{{ s.video_count }} {{ 'track' if s.stream_type == 'music' else 'video' }}{{ '' if s.video_count == 1 else 's' }}</span>
       {% if s.stream_type == 'music' %}<span>🎵 music</span>{% endif %}
       {% if s.runtime_label %}<span>{{ s.runtime_label }}</span>{% endif %}
       {% if s.size_label %}<span>{{ s.size_label }}</span>{% endif %}
-
-      {% if s.youtube_url %}
-        <a href="{{ s.youtube_url }}" target="_blank" class="yt-link">YouTube ↗</a>
-      {% endif %}
+      {% if s.youtube_url %}<a href="{{ s.youtube_url }}" target="_blank" class="yt-link">YouTube ↗</a>{% endif %}
     </div>
-
     <div style="display:flex; gap:8px; margin-top:16px;">
-
-      <a href="{{ url_for('stream_detail', stream_id=s.id) }}"
-         class="btn"
-         style="flex:1; justify-content:center;">
-        Open
-      </a>
-
-      <a href="{{ url_for('stream_edit', stream_id=s.id) }}"
-         class="btn"
-         style="flex:1; justify-content:center;">
-        Edit
-      </a>
-
+      <a href="{{ url_for('stream_detail', stream_id=s.id) }}" class="btn" style="flex:1; justify-content:center;">Open</a>
+      <a href="{{ url_for('stream_edit', stream_id=s.id) }}" class="btn" style="flex:1; justify-content:center;">Edit</a>
       {% if s.can_manage %}
-      <form method="POST"
-            action="{{ url_for('stream_delete', stream_id=s.id) }}"
-            onsubmit="return confirmDelete({{ s.name|tojson|forceescape }});"
-            style="margin:0; flex:1; display:flex;">
-        <button type="submit"
-                class="btn"
-                style="color:#d9534f; width:100%; justify-content:center;"
-                title="Delete stream">
-          Delete
-        </button>
+      <form method="POST" action="{{ url_for('stream_delete', stream_id=s.id) }}" onsubmit="return confirmDelete({{ s.name|tojson|forceescape }});" style="margin:0; flex:1; display:flex;">
+        <button type="submit" class="btn" style="color:#d9534f; width:100%; justify-content:center;" title="Delete stream">Delete</button>
       </form>
       {% endif %}
-
     </div>
-
   </div>
   {% endfor %}
-
 </div>
-
-<div id="no-filter-results"
-     class="card empty"
-     style="display:none;">
-  <p>No streams match your search/filter.</p>
+<div id="no-filter-results" class="card empty" style="display:none;"><p>No streams match your search/filter.</p></div>
+{% else %}
+<div class="card empty">
+  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="2" y="5" width="20" height="14" rx="2"/>
+    <path d="m10 9 l5 3 -5 3z" fill="currentColor" stroke="none"/>
+  </svg>
+  <p>No streams yet. Create your first 24/7 broadcast.</p>
+  <a href="{{ url_for('stream_create') }}" class="btn btn-primary">+ New stream</a>
 </div>
+{% endif %}
+
 
 <script>
-// Multi-select filters: a card matches when it fits ANY selected chip
-// (no chips selected = show everything). Search runs over every card
-// parameter and combines with the filters.
-const activeFilters = new Set();
+// 1. SYSTEM LOAD - Highest priority, must run regardless of streams
+async function updateSystemLoad() {
+  try {
+    const res = await fetch('/api/system_load');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const cpuVal = document.getElementById('sys-cpu-val');
+    const cpuBar = document.getElementById('sys-cpu-bar');
+    const ramVal = document.getElementById('sys-ram-val');
+    const ramBar = document.getElementById('sys-ram-bar');
+    
+    if (cpuVal) cpuVal.textContent = (data.cpu !== undefined ? data.cpu : 0) + '%';
+    if (cpuBar) {
+        cpuBar.style.width = (data.cpu || 0) + '%';
+        cpuBar.className = 'sys-bar-fill ' + (data.cpu >= 90 ? 'low' : (data.cpu >= 75 ? 'warn' : ''));
+    }
+    if (ramVal) ramVal.textContent = (data.ram !== undefined ? data.ram : 0) + '%';
+    if (ramBar) {
+        ramBar.style.width = (data.ram || 0) + '%';
+        ramBar.className = 'sys-bar-fill ' + (data.ram >= 90 ? 'low' : (data.ram >= 75 ? 'warn' : ''));
+    }
+  } catch (e) {
+    console.error('System load update failed:', e);
+  }
+}
+setInterval(updateSystemLoad, 3000);
+updateSystemLoad();
 
-// Live uptime timers on the tiles: seeded server-side from the runner's
-// session start, ticked client-side every second (HH:MM:SS, same as the
-// timer on the stream page).
+// 2. BASIC UTILS
+const activeFilters = new Set();
 function fmtHMS(total) {
   total = Math.max(0, Math.floor(total));
   const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 }
-
-const tileTimers = [...document.querySelectorAll('.tile-timer')].map(el => {
-  const uptime = parseFloat(el.dataset.uptime);
-  return { el, started: Date.now() / 1000 - uptime };
-});
-
-setInterval(() => {
-  const now = Date.now() / 1000;
-  tileTimers.forEach(t => {
-    t.el.textContent = fmtHMS(now - t.started);
-  });
-}, 1000);
-
-// Live switch: POST via fetch, then update the tile in place (pill, timer,
-// filter/search index) so nothing waits for a reload or for the runner
-// thread to publish its session start time.
 function replaceLast(str, from, to) {
   const i = str.lastIndexOf(from);
   return i === -1 ? str : str.slice(0, i) + to + str.slice(i + from.length);
 }
-
-// Compact corner toasts for switch actions (fetch results don't go through
-// the server-side flash machinery). Click a toast to dismiss it early.
 function showFlash(message, kind) {
   let stack = document.querySelector('.toast-stack');
   if (!stack) {
@@ -241,111 +261,96 @@ function showFlash(message, kind) {
   setTimeout(() => toast.remove(), kind === 'error' ? 6000 : 3500);
 }
 
+// 3. STREAM TIMERS - Safely initialized
+let tileTimers = [];
+function initTimers() {
+    try {
+        tileTimers = [...document.querySelectorAll('.tile-timer')].map(el => {
+            const uptime = parseFloat(el.dataset.uptime) || 0;
+            return { el, started: Date.now() / 1000 - uptime };
+        });
+    } catch(e) {
+        console.error('Timer init failed:', e);
+    }
+}
+initTimers();
+setInterval(() => {
+  const now = Date.now() / 1000;
+  tileTimers.forEach(t => { 
+      if (t.el) t.el.textContent = fmtHMS(now - t.started); 
+  });
+}, 1000);
+
+// 4. STREAM INTERACTION
 document.querySelectorAll('.live-switch').forEach(sw => {
   sw.closest('form').addEventListener('submit', async e => {
     e.preventDefault();
     const form = e.currentTarget;
     const card = sw.closest('.stream-card');
-    const timer = card.querySelector('.tile-timer');
-    const pill = card.querySelector('.pill');
+    const timer = card?.querySelector('.tile-timer');
+    const pill = card?.querySelector('.pill');
     const turningOn = !sw.classList.contains('on');
-
     sw.disabled = true;
     let data = null;
     try {
-      const resp = await fetch(form.action, {
-        method: 'POST',
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
-      });
+      const resp = await fetch(form.action, { method: 'POST', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
       if (resp.ok) data = await resp.json();
     } catch (err) {}
     sw.disabled = false;
     if (!data || !data.ok) {
       showFlash((data && data.message) || 'Something went wrong', 'error');
-      return;  // switch stays as-is; a manual refresh shows the real state
+      return;
     }
     showFlash(data.message, 'ok');
-
     sw.classList.toggle('on', turningOn);
     sw.setAttribute('aria-checked', turningOn ? 'true' : 'false');
     sw.title = turningOn ? 'Stop streaming' : 'Go live';
-    // Point the form at the opposite endpoint so the NEXT toggle posts correctly —
-    // otherwise an off→on→off cycle would hit the stale start URL and never stop.
-    form.action = turningOn
-      ? form.action.replace('/stream/start/', '/stream/stop/')
-      : form.action.replace('/stream/stop/', '/stream/start/');
-
+    form.action = turningOn ? form.action.replace('/stream/start/', '/stream/stop/') : form.action.replace('/stream/stop/', '/stream/start/');
     if (pill) {
       pill.className = 'pill ' + (turningOn ? 'pill-live' : 'pill-off');
       pill.innerHTML = '<span class="pdot"></span>' + (turningOn ? 'LIVE' : 'OFFLINE');
     }
-    card.dataset.status = turningOn ? 'live' : 'offline';
-    card.dataset.all = turningOn
-      ? replaceLast(card.dataset.all, 'offline', 'live')
-      : replaceLast(card.dataset.all, 'live', 'offline');
-
-    if (turningOn) {
+    if (card) {
+        card.dataset.status = turningOn ? 'live' : 'offline';
+        card.dataset.all = turningOn ? replaceLast(card.dataset.all, 'offline', 'live') : replaceLast(card.dataset.all, 'live', 'offline');
+    }
+    if (turningOn && timer) {
       timer.hidden = false;
       timer.dataset.uptime = '0';
       const t = tileTimers.find(t => t.el === timer);
       if (t) t.started = Date.now() / 1000;
       else tileTimers.push({ el: timer, started: Date.now() / 1000 });
-    } else {
+    } else if (timer) {
       timer.hidden = true;
     }
   });
 });
 
 function confirmDelete(name) {
-  return confirm(
-    'Delete stream "' + name + '"?\n\n' +
-    'The stream will be stopped and all uploaded videos will be deleted.'
-  );
+  return confirm('Delete stream "' + name + '"?\n\n' + 'The stream will be stopped and all uploaded videos will be deleted.');
 }
 
 function updateStreams() {
-  const search =
-    document.getElementById('stream-search').value
-      .trim()
-      .toLowerCase();
-
+  const searchInput = document.getElementById('stream-search');
+  const search = searchInput ? searchInput.value.trim().toLowerCase() : '';
   let visible = 0;
-
   document.querySelectorAll('.stream-item').forEach(function(item) {
-
-    // Status (live/offline) and type (music/video) are separate categories:
-    // multiple chips inside a category = ANY of them, across categories = BOTH.
     const selected = [...activeFilters];
     const wantedStatus = selected.filter(f => f === 'live' || f === 'offline');
     const wantedType = selected.filter(f => f === 'music' || f === 'video');
-
-    const matchesFilter =
-      (wantedStatus.length === 0 || wantedStatus.some(f => item.dataset.status === f)) &&
-      (wantedType.length === 0 || wantedType.some(f => item.dataset.type === f));
-
-    const matchesSearch =
-      !search ||
-      item.dataset.all.includes(search);
-
+    const matchesFilter = (wantedStatus.length === 0 || wantedStatus.some(f => item.dataset.status === f)) && (wantedType.length === 0 || wantedType.some(f => item.dataset.type === f));
+    const matchesSearch = !search || item.dataset.all.includes(search);
     const show = matchesFilter && matchesSearch;
-
     item.style.display = show ? '' : 'none';
-
-    if (show) {
-      visible++;
-    }
+    if (show) visible++;
   });
-
-  document.getElementById('no-filter-results').style.display =
-    visible === 0 ? 'block' : 'none';
+  const resultsMsg = document.getElementById('no-filter-results');
+  if (resultsMsg) resultsMsg.style.display = visible === 0 ? 'block' : 'none';
 }
 
-document.querySelectorAll('.filter-btn[data-filter]').forEach(function(button) {
-
+document.querySelectorAll('.filter-btn[data-filter]').forEach(button => {
   button.addEventListener('click', function() {
-
     const f = this.dataset.filter;
-
     if (activeFilters.has(f)) {
       activeFilters.delete(f);
       this.classList.remove('active');
@@ -353,35 +358,40 @@ document.querySelectorAll('.filter-btn[data-filter]').forEach(function(button) {
       activeFilters.add(f);
       this.classList.add('active');
     }
-
     updateStreams();
   });
-
 });
 
-document.getElementById('filterReset').addEventListener('click', function() {
-  activeFilters.clear();
-  document.querySelectorAll('.filter-btn.active').forEach(function(btn) {
-    btn.classList.remove('active');
-  });
-  const search = document.getElementById('stream-search');
-  if (search) search.value = '';
-  updateStreams();
-});
+const filterReset = document.getElementById('filterReset');
+if (filterReset) {
+    filterReset.addEventListener('click', function() {
+        activeFilters.clear();
+        document.querySelectorAll('.filter-btn.active').forEach(btn => btn.classList.remove('active'));
+        const search = document.getElementById('stream-search');
+        if (search) search.value = '';
+        updateStreams();
+    });
+}
 
-document.getElementById('stream-search')
-  .addEventListener('input', updateStreams);
+const searchInput = document.getElementById('stream-search');
+if (searchInput) {
+    searchInput.addEventListener('input', updateStreams);
+}
 
-// Thumbnails toggle: remember the choice, collapse tiles when off.
 const thumbToggle = document.getElementById('thumbToggle');
 function applyThumbs(show) {
   document.body.classList.toggle('no-thumbs', !show);
   try { localStorage.setItem('sc-thumbs', show ? '1' : '0'); } catch (e) {}
+  // The cookie lets the server render the toggle's saved state on page load
+  // (no brief "on" flash when thumbnails were switched off).
+  document.cookie = 'sc-thumbs=' + (show ? '1' : '0') + '; path=/; max-age=31536000; SameSite=Lax';
 }
-try { thumbToggle.checked = localStorage.getItem('sc-thumbs') !== '0'; } catch (e) {}
-thumbToggle.addEventListener('change', () => applyThumbs(thumbToggle.checked));
+if (thumbToggle) {
+    try { thumbToggle.checked = localStorage.getItem('sc-thumbs') !== '0'; } catch (e) {}
+    applyThumbs(thumbToggle.checked);  // sync the class with the saved state on load
+    thumbToggle.addEventListener('change', () => applyThumbs(thumbToggle.checked));
+}
 
-// Encoding counter ticks live so uploads are visible without a reload.
 const encodeChip = document.getElementById('encodeChip');
 if (encodeChip) {
   setInterval(async () => {
@@ -394,54 +404,8 @@ if (encodeChip) {
     } catch (e) { /* transient */ }
   }, 5000);
 }
-
 updateStreams();
 </script>
 
-<style>
-.filter-btn.active {
-  opacity: 1;
-  font-weight: 600;
-}
 
-.filter-btn:not(.active) {
-  opacity: 0.7;
-}
-
-#stream-search:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(59,91,253,.14);
-}
-
-@media (max-width: 600px) {
-  #stream-search {
-    width: 100%;
-    min-width: 0;
-    margin-left: 0;
-  }
-}
-</style>
-
-{% else %}
-
-<div class="card empty">
-
-  <svg width="48" height="48" viewBox="0 0 24 24"
-       fill="none" stroke="currentColor" stroke-width="1.5">
-    <rect x="2" y="5" width="20" height="14" rx="2"/>
-    <path d="m10 9 5 3-5 3z"
-          fill="currentColor"
-          stroke="none"/>
-  </svg>
-
-  <p>No streams yet. Create your first 24/7 broadcast.</p>
-
-  <a href="{{ url_for('stream_create') }}"
-     class="btn btn-primary">
-    + New stream
-  </a>
-
-</div>
-
-{% endif %}
 {% endblock %}

@@ -76,6 +76,11 @@
       <div id="uploadItems" style="display:flex; flex-direction:column; gap:8px;"></div>
     </div>
 
+
+    <div class="field checkbox-row" style="margin-top:10px; display:flex; align-items:center; gap:8px; cursor:pointer;">
+      <input type="checkbox" id="already_encoded" name="already_encoded" style="width:16px; height:16px;">
+      <label for="already_encoded" style="font-size:13px; cursor:pointer;">File is already encoded (skip ffmpeg)</label>
+    </div>
     <button type="submit" class="btn btn-primary" style="margin-top:14px" id="uploadBtn" disabled>Upload</button>
   </form>
 </div>
@@ -350,6 +355,10 @@ if (uploadForm) {
 
       const formData = new FormData();
       formData.append('video', file);
+      // The per-file XHR builds its own FormData, so form fields are not
+      // included automatically — forward the skip-encode checkbox explicitly.
+      const encCheckbox = document.getElementById('already_encoded');
+      if (encCheckbox && encCheckbox.checked) formData.append('already_encoded', 'on');
 
       return new Promise((resolve) => {
         const xhr = new XMLHttpRequest();
